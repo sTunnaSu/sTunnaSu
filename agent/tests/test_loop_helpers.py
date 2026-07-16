@@ -10,6 +10,7 @@ import pytest
 
 from src.agent.loop import (
     KEEP_RECENT,
+    PRESERVED_TOOL_RESULTS,
     COLLAPSE_PRESERVE_RECENT,
     COLLAPSE_TEXT_MIN,
     MICROCOMPACT_THRESHOLD,
@@ -95,6 +96,31 @@ class TestMicrocompact:
         ]
         _microcompact(messages)
         assert messages[0]["content"] != "[cleared]"
+
+    @pytest.mark.parametrize("tool_name", sorted(PRESERVED_TOOL_RESULTS))
+    def test_preserves_safety_critical_trading_results(self, tool_name: str) -> None:
+        messages = [
+            {
+                "role": "tool",
+                "name": tool_name,
+                "content": "x" * 500,
+                "tool_call_id": "critical",
+            }
+        ]
+        for index in range(KEEP_RECENT + 5):
+            messages.append(
+                {
+                    "role": "tool",
+                    "name": "trading_quote",
+                    "content": f"{'y' * 200}{index}",
+                    "tool_call_id": f"ordinary-{index}",
+                }
+            )
+
+        _microcompact(messages)
+
+        assert messages[0]["content"] == "x" * 500
+        assert any(message["content"] == "[cleared]" for message in messages[1:])
 
     def test_does_not_touch_non_tool(self) -> None:
         messages = [

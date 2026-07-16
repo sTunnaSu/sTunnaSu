@@ -53,6 +53,15 @@ KEEP_RECENT = 3
 TOOL_RESULT_LIMIT = 10_000
 LLM_USAGE_ARTIFACT = "llm_usage.json"
 
+PRESERVED_TOOL_RESULTS = frozenset(
+    {
+        "trading_paper_crypto_snapshot",
+        "trading_paper_preflight",
+        "trading_place_order",
+        "trading_cancel_order",
+    }
+)
+
 COLLAPSE_PRESERVE_RECENT = 6
 COLLAPSE_TEXT_MIN = 2400
 COLLAPSE_HEAD = 900
@@ -250,6 +259,8 @@ def _microcompact(messages: list) -> None:
     if len(tool_msgs) <= KEEP_RECENT:
         return
     for msg in tool_msgs[:-KEEP_RECENT]:
+        if msg.get("name") in PRESERVED_TOOL_RESULTS:
+            continue
         content = msg.get("content", "")
         if isinstance(content, str) and len(content) > 100:
             msg["content"] = "[cleared]"

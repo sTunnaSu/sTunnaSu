@@ -75,6 +75,39 @@ def get_account(profile_id: str | None = None, **overrides: Any) -> dict[str, An
     return _call_remote(profile, "account", {})
 
 
+def get_assets(
+    profile_id: str | None = None,
+    *,
+    asset_class: str = "crypto",
+    tradable_only: bool = True,
+    symbol: str | None = None,
+    quote_currency: str | None = None,
+    limit: int | None = None,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """List tradable assets and broker precision constraints when supported."""
+    profile = profile_by_id(profile_id)
+    if "assets.read" not in profile.capabilities:
+        return _unsupported(profile, "assets.read")
+    if profile.transport == "broker_sdk":
+        module = _sdk_module(profile.connector)
+        getter = getattr(module, "get_assets", None)
+        if getter is None:
+            return _unsupported(profile, "assets.read")
+        return _with_profile(
+            profile,
+            getter(
+                module.build_config(profile.config, overrides),
+                asset_class=asset_class,
+                tradable_only=tradable_only,
+                symbol=symbol,
+                quote_currency=quote_currency,
+                limit=limit,
+            ),
+        )
+    return _unsupported(profile, "assets.read")
+
+
 def get_positions(profile_id: str | None = None, **overrides: Any) -> dict[str, Any]:
     """Read positions for a connector profile."""
     profile = profile_by_id(profile_id)
@@ -222,6 +255,12 @@ def _order_classification(connector: str, symbol: str):
     non-US class, so the unknown case is fail-safe.
     """
     from src.live.mandate.model import AssetClass, InstrumentType
+
+    if connector == "alpaca":
+        from src.trading.connectors.alpaca.sdk import is_crypto_symbol
+
+        if is_crypto_symbol(symbol):
+            return InstrumentType.CRYPTO, AssetClass.CRYPTO
 
     instrument_name, asset_name = _CONNECTOR_INSTRUMENT.get(connector, ("equity", None))
     instrument = InstrumentType(instrument_name)

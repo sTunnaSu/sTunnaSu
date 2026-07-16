@@ -221,7 +221,7 @@ def _load_optimizer(config: Dict[str, Any]) -> Optional[Callable]:
         return None
 
 
-def _normalise_fundamental_fields(config: Dict[str, Any]) -> dict[str, list[str]]:
+def _normalise_fundamental_fields(config: Dict[str, Any]) -> dict[str, Iterable[str]]:
     """Read the optional statement-table field map from backtest config."""
     raw_fields = config.get("fundamental_fields")
     if raw_fields in (None, {}):
@@ -229,7 +229,7 @@ def _normalise_fundamental_fields(config: Dict[str, Any]) -> dict[str, list[str]
     if not isinstance(raw_fields, dict):
         raise ValueError("fundamental_fields must map table names to field-name lists")
 
-    normalized: dict[str, list[str]] = {}
+    normalized: dict[str, Iterable[str]] = {}
     for table, fields in raw_fields.items():
         if not isinstance(table, str) or not table.strip():
             raise ValueError("fundamental_fields table names must be non-empty strings")
@@ -381,6 +381,68 @@ class BaseEngine(ABC):
         self._execution_dates = pd.DatetimeIndex([])
         self._bar_idx: int = 0
         self._active_symbol: str = ""  # set by _rebalance/_close_position for subclass use
+        # Optional Phase 8 observer.  When absent, every legacy path is
+        # byte-for-byte equivalent in authority and behavior.  When attached,
+        # it may only authorise a prepared submission and observe actual state
+        # changes; sizing, pricing, fills, cancellation and expiry stay here.
+        self._order_lifecycle_observer: Any | None = None
+        self._order_lifecycle_authorizations: Dict[str, Any] = {}
+
+    def set_order_lifecycle_observer(self, observer: Any | None) -> None:
+        """Attach a fail-closed Phase 8 authoriser/observer to this run."""
+        self._order_lifecycle_observer = observer
+
+    def _authorise_order_submission(self, intent: Dict[str, Any]) -> Any | None:
+        """Return an opaque approval token, or ``None`` to block submission."""
+        observer = self._order_lifecycle_observer
+        if observer is None:
+            return True
+        try:
+            authorization = observer.authorize_submission(dict(intent))
+            if authorization is None:
+                return None
+            validator = getattr(observer, "validate_authorization", None)
+            if validator is None or not bool(validator(dict(intent), authorization)):
+                logger.error("Phase 8 order authorization failed identity validation")
+                return None
+            return authorization
+        except Exception:
+            logger.exception("Phase 8 order authorisation failed closed")
+            return None
+
+    def _notify_order_submitted(self, order: OrderRecord, authorization: Any) -> None:
+        observer = self._order_lifecycle_observer
+        if observer is None or authorization is None:
+            return
+        self._order_lifecycle_authorizations[order.order_id] = authorization
+        try:
+            observer.on_order_submitted(order, authorization)
+        except Exception:
+            # The actual submission already occurred.  The execution engine
+            # remains authoritative and cannot be rolled back by observability.
+            logger.exception("Phase 8 submission callback failed after actual submission")
+
+    def _notify_order_fill(self, order: OrderRecord, fill: FillRecord) -> None:
+        observer = self._order_lifecycle_observer
+        if observer is None or order.order_id not in self._order_lifecycle_authorizations:
+            return
+        try:
+            observer.on_fill(order, fill)
+        except Exception:
+            logger.exception("Phase 8 fill callback failed after actual fill")
+
+    def _notify_order_terminal(self, order: OrderRecord) -> None:
+        observer = self._order_lifecycle_observer
+        if (
+            observer is None
+            or order.order_id not in self._order_lifecycle_authorizations
+            or order.status not in {"filled", "cancelled", "expired", "rejected"}
+        ):
+            return
+        try:
+            observer.on_order_terminal(order)
+        except Exception:
+            logger.exception("Phase 8 terminal callback failed after actual terminal transition")
 
     # ── Market rule interface (subclass must implement) ──
 
@@ -1058,8 +1120,9 @@ class BaseEngine(ABC):
             # Pending residuals are cancelled before the terminal flattening
             # order. Any quantity already filled remains in the position and
             # is liquidated exactly once below.
-            for order in list(self.pending_orders.values()):
-                order.cancel(last_ts, "end_of_backtest")
+            for pending_order in list(self.pending_orders.values()):
+                pending_order.cancel(last_ts, "end_of_backtest")
+                self._notify_order_terminal(pending_order)
             self.pending_orders.clear()
 
             for c in list(self.positions.keys()):
@@ -1393,6 +1456,7 @@ class BaseEngine(ABC):
             )
             if incompatible:
                 pending.cancel(ts, "signal_changed")
+                self._notify_order_terminal(pending)
                 self.pending_orders.pop(symbol, None)
             else:
                 pending_event = pending.event_type
@@ -1483,6 +1547,8 @@ class BaseEngine(ABC):
         time_in_force: str | None = None,
         latency_bars: int | None = None,
         expiry_bars: int | None = None,
+        phase8_decision_id: str | None = None,
+        phase8_signal_id: str | None = None,
     ) -> OrderRecord:
         """Create and register a persistent entry or exit order."""
         if event_type not in {"entry", "exit"}:
@@ -1568,6 +1634,37 @@ class BaseEngine(ABC):
             created_bar_index + resolved_expiry
             if resolved_expiry is not None else None
         )
+        authorization: Any | None = None
+        intent = {
+            "decision_id": phase8_decision_id,
+            "signal_id": phase8_signal_id,
+            "symbol": symbol,
+            "side": side,
+            "event_type": event_type,
+            "direction": direction,
+            "quantity": safe_quantity,
+            "submitted_at": pd.Timestamp(timestamp),
+            "decision_price": safe_decision_price,
+            "order_type": resolved_type,
+            "limit_price": resolved_limit,
+            "time_in_force": resolved_tif,
+            "participation_limit": self._participation_rate_for(symbol),
+            "expiry_at": self._bar_time(expires_bar_index),
+            "signal_time": signal_time,
+        }
+        if not rejection_reason and self._order_lifecycle_observer is not None:
+            observer = self._order_lifecycle_observer
+            requires_authorization = True
+            try:
+                predicate = getattr(observer, "requires_authorization", None)
+                if predicate is not None:
+                    requires_authorization = bool(predicate(dict(intent)))
+            except Exception:
+                logger.exception("Phase 8 authorization-scope check failed closed")
+            if requires_authorization:
+                authorization = self._authorise_order_submission(intent)
+                if authorization is None:
+                    rejection_reason = "phase8_not_authorized"
         terminal = bool(rejection_reason)
         order = OrderRecord(
             order_id=self._next_order_id(),
@@ -1597,6 +1694,7 @@ class BaseEngine(ABC):
         self.orders.append(order)
         if not terminal:
             self.pending_orders[symbol] = order
+            self._notify_order_submitted(order, authorization)
         return order
 
     def _affordable_entry_quantity(
@@ -1715,6 +1813,7 @@ class BaseEngine(ABC):
             ):
                 order.cancel(timestamp, f"max_unfilled_bars:{reason}")
         if order.status not in {"open", "partially_filled"}:
+            self._notify_order_terminal(order)
             self.pending_orders.pop(order.symbol, None)
 
     def _process_order(
@@ -1732,6 +1831,7 @@ class BaseEngine(ABC):
             and self._bar_idx > order.expires_bar_index
         ):
             order.expire(timestamp, "order_expiry_bars")
+            self._notify_order_terminal(order)
             self.pending_orders.pop(order.symbol, None)
             return 0.0
         if self._bar_idx < order.eligible_bar_index:
@@ -1743,6 +1843,7 @@ class BaseEngine(ABC):
         rejection_reason = self.order_rejection_reason(order, bar, timestamp)
         if rejection_reason:
             order.reject(timestamp, rejection_reason)
+            self._notify_order_terminal(order)
             self.pending_orders.pop(order.symbol, None)
             return 0.0
         execution_direction = (
@@ -1823,6 +1924,7 @@ class BaseEngine(ABC):
             position = self.positions.get(order.symbol)
             if position is None:
                 order.cancel(timestamp, "position_missing")
+                self._notify_order_terminal(order)
                 return 0.0
             quantity = min(quantity, abs(float(position.size)))
             try:
@@ -1870,6 +1972,7 @@ class BaseEngine(ABC):
         if order.time_in_force == "IOC" and order.status == "partially_filled":
             order.cancel(timestamp, "ioc_residual")
         if order.status not in {"open", "partially_filled"}:
+            self._notify_order_terminal(order)
             self.pending_orders.pop(order.symbol, None)
         return quantity
 
@@ -1936,7 +2039,7 @@ class BaseEngine(ABC):
             )
         self.positions[order.symbol] = position
         volume_context = volume_context or {}
-        self.fills.append(FillRecord(
+        fill = FillRecord(
             timestamp=timestamp,
             symbol=order.symbol,
             side=order.side,
@@ -1965,7 +2068,9 @@ class BaseEngine(ABC):
             eligible_bar_index=order.eligible_bar_index,
             execution_bar_index=self._bar_idx,
             time_in_force=order.time_in_force,
-        ))
+        )
+        self.fills.append(fill)
+        self._notify_order_fill(order, fill)
 
     def _start_exit_accumulator(self, position: Position) -> Dict[str, Any]:
         """Capture entry state for a sequence of partial exits."""
@@ -2048,7 +2153,7 @@ class BaseEngine(ABC):
         accumulator["last_reason"] = order.reason
 
         volume_context = volume_context or {}
-        self.fills.append(FillRecord(
+        fill = FillRecord(
             timestamp=timestamp,
             symbol=order.symbol,
             side=order.side,
@@ -2077,7 +2182,9 @@ class BaseEngine(ABC):
             eligible_bar_index=order.eligible_bar_index,
             execution_bar_index=self._bar_idx,
             time_in_force=order.time_in_force,
-        ))
+        )
+        self.fills.append(fill)
+        self._notify_order_fill(order, fill)
 
         remaining = max(position.size - quantity, 0.0)
         if remaining > 1e-9:
@@ -2175,6 +2282,7 @@ class BaseEngine(ABC):
         pending = self.pending_orders.pop(symbol, None)
         if pending is not None:
             pending.cancel(exit_time, f"forced_close:{reason}")
+            self._notify_order_terminal(pending)
         decision_price = (
             float(exit_decision_price)
             if exit_decision_price is not None
@@ -2212,6 +2320,7 @@ class BaseEngine(ABC):
                 "volume_limit_exempt": participation_rate is not None,
             },
         )
+        self._notify_order_terminal(order)
 
     # ── Artifacts ──
 

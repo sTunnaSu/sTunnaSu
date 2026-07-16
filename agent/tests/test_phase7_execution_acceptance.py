@@ -19,6 +19,11 @@ STARTING_CAPITAL = 100_000.0
 FIXTURE_SHA256 = "925caa4dbce36342cf89bf66a7dd88096439896565ad3931cac5978119df424d"
 
 
+def _canonical_fixture_bytes(path: Path) -> bytes:
+    """Hash fixture content independently of Git checkout newline policy."""
+    return path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
 class HistoricalFixtureLoader:
     """Offline loader for immutable, real SPY OHLCV observations."""
 
@@ -100,7 +105,7 @@ def _prepare_run_directory(run_dir: Path, config: dict) -> None:
 def test_phase7_historical_execution_and_artifact_reconciliation(
     tmp_path: Path,
 ) -> None:
-    assert hashlib.sha256(FIXTURE_PATH.read_bytes()).hexdigest() == FIXTURE_SHA256
+    assert hashlib.sha256(_canonical_fixture_bytes(FIXTURE_PATH)).hexdigest() == FIXTURE_SHA256
     config = {
         **_base_config(),
         "order_type": "limit",
