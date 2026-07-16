@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from src.trading.types import READ_CAPABILITIES, TradingProfile
 
+ALPACA_READ_CAPABILITIES = READ_CAPABILITIES + ("assets.read",)
+
 ALPACA_PROFILES: tuple[TradingProfile, ...] = (
     TradingProfile(
         id="alpaca-paper-sdk",
@@ -19,7 +21,7 @@ ALPACA_PROFILES: tuple[TradingProfile, ...] = (
         label="Alpaca Paper · alpaca-py",
         environment="paper",
         transport="broker_sdk",
-        capabilities=READ_CAPABILITIES,
+        capabilities=ALPACA_READ_CAPABILITIES,
         readonly=True,
         config={"profile": "paper", "feed": "iex"},
         notes=(
@@ -33,7 +35,7 @@ ALPACA_PROFILES: tuple[TradingProfile, ...] = (
         label="Alpaca Live · alpaca-py Read-Only",
         environment="live",
         transport="broker_sdk",
-        capabilities=READ_CAPABILITIES,
+        capabilities=ALPACA_READ_CAPABILITIES,
         readonly=True,
         config={"profile": "live-readonly", "feed": "iex"},
         notes="Reads an Alpaca live account only (api.alpaca.markets). Order placement is not exposed in this profile.",
@@ -44,7 +46,7 @@ ALPACA_PROFILES: tuple[TradingProfile, ...] = (
         label="Alpaca Paper · alpaca-py Trade",
         environment="paper",
         transport="broker_sdk",
-        capabilities=READ_CAPABILITIES + ("orders.place",),
+        capabilities=ALPACA_READ_CAPABILITIES + ("orders.place",),
         readonly=False,
         config={"profile": "paper", "feed": "iex"},
         notes=(
@@ -59,7 +61,7 @@ ALPACA_PROFILES: tuple[TradingProfile, ...] = (
         label="Alpaca Live · alpaca-py Trade",
         environment="live",
         transport="broker_sdk",
-        capabilities=READ_CAPABILITIES + ("orders.place.requires_mandate",),
+        capabilities=ALPACA_READ_CAPABILITIES + ("orders.place.requires_mandate",),
         readonly=False,
         config={"profile": "live", "feed": "iex"},
         notes=(

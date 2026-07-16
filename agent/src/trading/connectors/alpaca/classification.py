@@ -16,8 +16,11 @@ ALPACA_TOOL_CLASS: dict[str, ToolClass] = {
     "get_all_positions": ToolClass.READ,
     "get_open_position": ToolClass.READ,
     "get_orders": ToolClass.READ,
+    "get_all_assets": ToolClass.READ,
     "get_stock_latest_quote": ToolClass.READ,
     "get_stock_bars": ToolClass.READ,
+    "get_crypto_latest_quote": ToolClass.READ,
+    "get_crypto_bars": ToolClass.READ,
     # WRITE
     "submit_order": ToolClass.WRITE,
     "cancel_order_by_id": ToolClass.WRITE,

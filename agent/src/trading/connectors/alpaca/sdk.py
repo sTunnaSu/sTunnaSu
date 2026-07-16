@@ -25,9 +25,12 @@ import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass
+from functools import wraps
 from pathlib import Path
+from threading import RLock
 from types import ModuleType
 from typing import Any, Mapping
+from urllib.parse import urlencode
 
 from src.config.paths import get_runtime_root
 from src.trading import tap_forward
@@ -52,6 +55,19 @@ LIVE_HOST = "https://api.alpaca.markets"
 # ``alpaca`` TAP credential covers it (with ``data.alpaca.markets`` as a second
 # ``allowed_hosts`` entry).
 DATA_HOST = "https://data.alpaca.markets"
+
+_CRYPTO_QUOTE_CURRENCIES = ("USDT", "USDC", "USD", "BTC")
+_ALPACA_SDK_LOCK = RLock()
+
+
+def _serialized_sdk_call(func):  # noqa: ANN001, ANN202
+    """Serialize Alpaca SDK entry points to avoid concurrent lazy-import deadlocks."""
+    @wraps(func)
+    def wrapped(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        with _ALPACA_SDK_LOCK:
+            return func(*args, **kwargs)
+
+    return wrapped
 
 
 class AlpacaDependencyError(RuntimeError):
@@ -248,6 +264,38 @@ def _rest_timeframe(period: str) -> str:
     }.get(period.strip(), "1Day")
 
 
+def normalize_symbol(symbol: str) -> str:
+    """Return Alpaca's canonical symbol form.
+
+    Equities remain unchanged. Common crypto aliases such as ``BTCUSD`` and
+    ``BTC-USD`` are normalized to Alpaca's current pair form, ``BTC/USD``.
+    The asset endpoint remains the authority for whether the normalized pair is
+    actually tradable.
+    """
+    clean = str(symbol or "").strip().upper()
+    if not clean:
+        return ""
+    for separator in ("-", "_"):
+        if separator in clean:
+            base, quote, *rest = clean.split(separator)
+            if not rest and base and quote in _CRYPTO_QUOTE_CURRENCIES:
+                return f"{base}/{quote}"
+    if "/" in clean:
+        base, quote, *rest = clean.split("/")
+        if not rest and base and quote:
+            return f"{base}/{quote}"
+        return clean
+    for quote in _CRYPTO_QUOTE_CURRENCIES:
+        if clean.endswith(quote) and len(clean) > len(quote) + 1:
+            return f"{clean[:-len(quote)]}/{quote}"
+    return clean
+
+
+def is_crypto_symbol(symbol: str) -> bool:
+    """Return whether ``symbol`` resolves to an Alpaca crypto pair."""
+    return "/" in normalize_symbol(symbol)
+
+
 def alpaca_available() -> bool:
     """Return whether the optional ``alpaca-py`` SDK can be imported."""
     try:
@@ -257,6 +305,7 @@ def alpaca_available() -> bool:
         return False
 
 
+@_serialized_sdk_call
 def check_status(config: AlpacaConfig | None = None) -> dict[str, Any]:
     """Check SDK readiness and config completeness without mutating broker state."""
     cfg = config or load_config()
@@ -295,6 +344,65 @@ def check_status(config: AlpacaConfig | None = None) -> dict[str, Any]:
     return report
 
 
+@_serialized_sdk_call
+def get_assets(
+    config: AlpacaConfig | None = None,
+    *,
+    asset_class: str = "crypto",
+    tradable_only: bool = True,
+    symbol: str | None = None,
+    quote_currency: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """List Alpaca assets with trading constraints and paper eligibility.
+
+    Crypto is the default because equities already have broad symbol-search
+    coverage elsewhere in the application. The response preserves Alpaca's
+    canonical pair symbol and minimum order/trade increments so an agent never
+    has to guess broker symbology or precision.
+    """
+    cfg = config or load_config()
+    class_token = str(asset_class or "crypto").strip().lower()
+    if class_token not in ("crypto", "us_equity"):
+        return {"status": "error", "error": "asset_class must be 'crypto' or 'us_equity'"}
+
+    if tap_forward.tap_enabled():
+        query = urlencode({"status": "active", "asset_class": class_token})
+        raw_assets = _read_via_tap(f"{cfg.host}/v2/assets?{query}")
+    else:
+        client = _trading_client(cfg)
+        from alpaca.trading.enums import AssetClass, AssetStatus  # type: ignore
+        from alpaca.trading.requests import GetAssetsRequest  # type: ignore
+
+        sdk_class = AssetClass.CRYPTO if class_token == "crypto" else AssetClass.US_EQUITY
+        raw_assets = client.get_all_assets(
+            GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=sdk_class)
+        )
+
+    rows = [_asset_to_dict(item, is_paper=cfg.is_paper) for item in _as_iter(raw_assets)]
+    if tradable_only:
+        rows = [row for row in rows if row["tradable"]]
+    if symbol:
+        canonical = normalize_symbol(symbol)
+        rows = [row for row in rows if row["symbol"] == canonical]
+    if quote_currency:
+        suffix = "/" + str(quote_currency).strip().upper()
+        rows = [row for row in rows if str(row["symbol"]).endswith(suffix)]
+    rows.sort(key=lambda row: str(row["symbol"]))
+    if limit is not None:
+        rows = rows[: max(0, int(limit))]
+    return {
+        "status": "ok",
+        "profile": cfg.profile,
+        "is_paper": cfg.is_paper,
+        "host": cfg.host,
+        "asset_class": class_token,
+        "count": len(rows),
+        "assets": rows,
+    }
+
+
+@_serialized_sdk_call
 def get_account_snapshot(config: AlpacaConfig | None = None) -> dict[str, Any]:
     """Fetch account summary for the configured account."""
     cfg = config or load_config()
@@ -321,6 +429,7 @@ def get_account_snapshot(config: AlpacaConfig | None = None) -> dict[str, Any]:
     }
 
 
+@_serialized_sdk_call
 def get_positions(config: AlpacaConfig | None = None) -> dict[str, Any]:
     """Fetch current positions for the configured account."""
     cfg = config or load_config()
@@ -332,6 +441,7 @@ def get_positions(config: AlpacaConfig | None = None) -> dict[str, Any]:
     return {"status": "ok", "profile": cfg.profile, "is_paper": cfg.is_paper, "positions": rows}
 
 
+@_serialized_sdk_call
 def get_open_orders(config: AlpacaConfig | None = None, *, include_executions: bool = False) -> dict[str, Any]:
     """Fetch open orders and, optionally, recently filled orders."""
     cfg = config or load_config()
@@ -363,13 +473,28 @@ def get_open_orders(config: AlpacaConfig | None = None, *, include_executions: b
     return result
 
 
+@_serialized_sdk_call
 def get_quote(symbol: str, *, config: AlpacaConfig | None = None, **_: Any) -> dict[str, Any]:
     """Fetch a latest quote snapshot for ``symbol``."""
     cfg = config or load_config()
-    clean = symbol.strip().upper()
-    if tap_forward.tap_enabled():
+    clean = normalize_symbol(symbol)
+    crypto = is_crypto_symbol(clean)
+    if tap_forward.tap_enabled() and crypto:
+        query = urlencode({"symbols": clean})
+        payload = _read_via_tap(f"{DATA_HOST}/v1beta3/crypto/us/latest/quotes?{query}")
+        quotes = _obj_get(payload, "quotes") or {}
+        raw_quote = quotes.get(clean) if isinstance(quotes, Mapping) else None
+        quote: Any = _rename_keys(raw_quote, _QUOTE_KEY_ALIASES)
+    elif tap_forward.tap_enabled():
         payload = _read_via_tap(f"{DATA_HOST}/v2/stocks/{clean}/quotes/latest?feed={cfg.feed}")
-        quote: Any = _rename_keys(_obj_get(payload, "quote"), _QUOTE_KEY_ALIASES)
+        quote = _rename_keys(_obj_get(payload, "quote"), _QUOTE_KEY_ALIASES)
+    elif crypto:
+        client = _crypto_data_client(cfg)
+        from alpaca.data.requests import CryptoLatestQuoteRequest  # type: ignore
+
+        req = CryptoLatestQuoteRequest(symbol_or_symbols=clean)
+        quotes = client.get_crypto_latest_quote(req)
+        quote = quotes.get(clean) if isinstance(quotes, Mapping) else _obj_get(quotes, clean)
     else:
         client = _data_client(cfg)
         from alpaca.data.requests import StockLatestQuoteRequest  # type: ignore
@@ -380,6 +505,7 @@ def get_quote(symbol: str, *, config: AlpacaConfig | None = None, **_: Any) -> d
     return {
         "status": "ok",
         "symbol": clean,
+        "asset_class": "crypto" if crypto else "us_equity",
         "quote": {
             "bid": _obj_get(quote, "bid_price"),
             "ask": _obj_get(quote, "ask_price"),
@@ -390,6 +516,7 @@ def get_quote(symbol: str, *, config: AlpacaConfig | None = None, **_: Any) -> d
     }
 
 
+@_serialized_sdk_call
 def get_historical_bars(
     symbol: str,
     *,
@@ -400,14 +527,32 @@ def get_historical_bars(
 ) -> dict[str, Any]:
     """Fetch historical bars for ``symbol`` (``period`` is a canonical token)."""
     cfg = config or load_config()
-    clean = symbol.strip().upper()
-    if tap_forward.tap_enabled():
+    clean = normalize_symbol(symbol)
+    crypto = is_crypto_symbol(clean)
+    if tap_forward.tap_enabled() and crypto:
+        query = urlencode(
+            {"symbols": clean, "timeframe": _rest_timeframe(period), "limit": int(limit)}
+        )
+        payload = _read_via_tap(f"{DATA_HOST}/v1beta3/crypto/us/bars?{query}")
+        bars_by_symbol = _obj_get(payload, "bars") or {}
+        raw_rows = bars_by_symbol.get(clean, []) if isinstance(bars_by_symbol, Mapping) else []
+        rows: Any = [_rename_keys(item, _BAR_KEY_ALIASES) for item in _as_iter(raw_rows)]
+    elif tap_forward.tap_enabled():
         url = (
             f"{DATA_HOST}/v2/stocks/{clean}/bars"
             f"?timeframe={_rest_timeframe(period)}&limit={int(limit)}&feed={cfg.feed}"
         )
         payload = _read_via_tap(url)
-        rows: Any = [_rename_keys(item, _BAR_KEY_ALIASES) for item in _as_iter(_obj_get(payload, "bars") or [])]
+        rows = [_rename_keys(item, _BAR_KEY_ALIASES) for item in _as_iter(_obj_get(payload, "bars") or [])]
+    elif crypto:
+        client = _crypto_data_client(cfg)
+        from alpaca.data.requests import CryptoBarsRequest  # type: ignore
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit  # type: ignore
+
+        timeframe = _timeframe(period, TimeFrame, TimeFrameUnit)
+        req = CryptoBarsRequest(symbol_or_symbols=clean, timeframe=timeframe, limit=int(limit))
+        bars = client.get_crypto_bars(req)
+        rows = bars.data.get(clean, []) if hasattr(bars, "data") else _as_iter(bars)
     else:
         client = _data_client(cfg)
         from alpaca.data.requests import StockBarsRequest  # type: ignore
@@ -420,11 +565,13 @@ def get_historical_bars(
     return {
         "status": "ok",
         "symbol": clean,
+        "asset_class": "crypto" if crypto else "us_equity",
         "period": period,
         "bars": [_bar_to_dict(item) for item in _as_iter(rows)],
     }
 
 
+@_serialized_sdk_call
 def place_order(
     config: AlpacaConfig | None = None,
     *,
@@ -446,13 +593,15 @@ def place_order(
 
     Args:
         config: Connector config; falls back to the saved config when ``None``.
-        symbol: Equity symbol (case-insensitive, whitespace tolerated).
+        symbol: Equity symbol or crypto pair. ``BTCUSD``/``BTC-USD`` aliases
+            normalize to Alpaca's canonical ``BTC/USD`` form.
         side: ``buy`` or ``sell``.
         quantity: Share quantity; mutually exclusive with ``notional``.
         notional: Dollar amount (fractional); mutually exclusive with ``quantity``.
         order_type: ``market`` or ``limit``.
         limit_price: Required when ``order_type`` is ``limit``.
-        time_in_force: ``day`` or ``gtc``.
+        time_in_force: Equities accept ``day``/``gtc``; crypto accepts
+            ``gtc``/``ioc``.
 
     Returns:
         On success ``{"status": "ok", "order_id", "symbol", "side", "profile",
@@ -463,9 +612,10 @@ def place_order(
     """
     cfg = config or load_config()
 
-    clean_symbol = str(symbol or "").strip().upper()
+    clean_symbol = normalize_symbol(symbol)
     if not clean_symbol:
         return {"status": "error", "error": "symbol is required"}
+    crypto = is_crypto_symbol(clean_symbol)
 
     side_token = str(side or "").strip().lower()
     if side_token not in ("buy", "sell"):
@@ -476,8 +626,16 @@ def place_order(
         return {"status": "error", "error": "order_type must be 'market' or 'limit'"}
 
     tif_token = str(time_in_force or "").strip().lower()
-    if tif_token not in ("day", "gtc"):
-        return {"status": "error", "error": "time_in_force must be 'day' or 'gtc'"}
+    allowed_tif = ("gtc", "ioc") if crypto else ("day", "gtc")
+    if tif_token not in allowed_tif:
+        return {
+            "status": "error",
+            "error": (
+                "crypto time_in_force must be 'gtc' or 'ioc'"
+                if crypto
+                else "equity time_in_force must be 'day' or 'gtc'"
+            ),
+        }
 
     has_qty = quantity is not None
     has_notional = notional is not None
@@ -534,7 +692,11 @@ def place_order(
         )
 
         order_side = OrderSide.BUY if side_token == "buy" else OrderSide.SELL
-        tif = TimeInForce.DAY if tif_token == "day" else TimeInForce.GTC
+        tif = {
+            "day": TimeInForce.DAY,
+            "gtc": TimeInForce.GTC,
+            "ioc": TimeInForce.IOC,
+        }[tif_token]
         amount = {"qty": qty_value} if has_qty else {"notional": notional_value}
 
         if type_token == "limit":
@@ -563,6 +725,7 @@ def place_order(
         "status": "ok",
         "order_id": str(_obj_get(order, "id", "")),
         "symbol": clean_symbol,
+        "asset_class": "crypto" if crypto else "us_equity",
         "side": side_token,
         "profile": cfg.profile,
         "is_paper": cfg.is_paper,
@@ -650,6 +813,7 @@ def _submit_via_tap(
         "status": "ok",
         "order_id": str(payload.get("id", "")),
         "symbol": symbol,
+        "asset_class": "crypto" if is_crypto_symbol(symbol) else "us_equity",
         "side": side,
         "profile": cfg.profile,
         "is_paper": cfg.is_paper,
@@ -664,6 +828,7 @@ def _submit_via_tap(
     }
 
 
+@_serialized_sdk_call
 def cancel_order(
     config: AlpacaConfig | None = None,
     order_id: str = "",
@@ -792,6 +957,13 @@ def _data_client(cfg: AlpacaConfig):
     return StockHistoricalDataClient(cfg.api_key, cfg.secret_key)
 
 
+def _crypto_data_client(cfg: AlpacaConfig):
+    _require_alpaca()
+    from alpaca.data.historical import CryptoHistoricalDataClient  # type: ignore
+
+    return CryptoHistoricalDataClient(cfg.api_key, cfg.secret_key)
+
+
 def _data_feed(cfg: AlpacaConfig):
     """Map the configured ``feed`` string to the Alpaca ``DataFeed`` enum."""
     _require_alpaca()
@@ -845,16 +1017,45 @@ def _obj_get(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
+def _enum_text(value: Any) -> str:
+    """Return the wire value for SDK enums and plain text unchanged."""
+    return str(getattr(value, "value", value) or "")
+
+
 def _position_to_dict(item: Any) -> dict[str, Any]:
     return {
         "symbol": _obj_get(item, "symbol"),
-        "side": str(_obj_get(item, "side", "")),
+        "asset_class": _enum_text(_obj_get(item, "asset_class", "")),
+        "exchange": _enum_text(_obj_get(item, "exchange", "")),
+        "side": _enum_text(_obj_get(item, "side", "")),
         "quantity": _obj_get(item, "qty"),
+        "quantity_available": _obj_get(item, "qty_available"),
         "average_cost": _obj_get(item, "avg_entry_price"),
         "market_value": _obj_get(item, "market_value"),
         "current_price": _obj_get(item, "current_price"),
         "unrealized_pnl": _obj_get(item, "unrealized_pl"),
         "cost_basis": _obj_get(item, "cost_basis"),
+    }
+
+
+def _asset_to_dict(item: Any, *, is_paper: bool) -> dict[str, Any]:
+    tradable = bool(_obj_get(item, "tradable", False))
+    asset_class = _obj_get(item, "asset_class") or _obj_get(item, "class", "")
+    return {
+        "asset_id": str(_obj_get(item, "id", "")),
+        "symbol": normalize_symbol(str(_obj_get(item, "symbol", ""))),
+        "name": _obj_get(item, "name"),
+        "status": _enum_text(_obj_get(item, "status", "")),
+        "asset_class": _enum_text(asset_class),
+        "exchange": _enum_text(_obj_get(item, "exchange", "")),
+        "tradable": tradable,
+        "fractionable": bool(_obj_get(item, "fractionable", False)),
+        "min_order_size": _obj_get(item, "min_order_size"),
+        "min_trade_increment": _obj_get(item, "min_trade_increment"),
+        "price_increment": _obj_get(item, "price_increment"),
+        "marginable": bool(_obj_get(item, "marginable", False)),
+        "shortable": bool(_obj_get(item, "shortable", False)),
+        "paper_eligible": bool(is_paper and tradable),
     }
 
 

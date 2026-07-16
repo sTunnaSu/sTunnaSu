@@ -9,7 +9,11 @@ import pytest
 
 from src.trading import profiles, service
 from src.tools import build_registry
-from src.tools.trading_connector_tool import TradingPlaceOrderTool, TradingSelectConnectionTool
+from src.tools.trading_connector_tool import (
+    TradingCancelOrderTool,
+    TradingPlaceOrderTool,
+    TradingSelectConnectionTool,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -119,6 +123,70 @@ def test_place_order_tool_treats_zero_unused_sizing_field_as_absent(
     assert calls[0]["notional"] is None
     assert calls[1]["quantity"] is None
     assert calls[1]["notional"] == 50.0
+
+
+def test_place_order_tool_allows_distinct_exit_but_blocks_exact_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    def fake_place_order(symbol, connection, **kwargs):  # noqa: ANN001
+        calls.append({"symbol": symbol, "connection": connection, **kwargs})
+        return {"status": "ok", "order_id": f"order-{len(calls)}"}
+
+    monkeypatch.setattr("src.tools.trading_connector_tool.place_order", fake_place_order)
+    tool = TradingPlaceOrderTool()
+    entry = {
+        "symbol": "BTC/USD",
+        "connection": "alpaca-paper-trade",
+        "side": "buy",
+        "notional": 100,
+        "order_type": "limit",
+        "limit_price": 65000,
+        "time_in_force": "gtc",
+    }
+
+    first = json.loads(tool.execute(**entry))
+    duplicate = json.loads(tool.execute(**entry))
+    exit_result = json.loads(
+        tool.execute(
+            symbol="BTC/USD",
+            connection="alpaca-paper-trade",
+            side="sell",
+            quantity=0.0015,
+            order_type="market",
+            time_in_force="gtc",
+        )
+    )
+
+    assert tool.repeatable is True
+    assert first["status"] == "ok"
+    assert duplicate["error_code"] == "duplicate_order_request_blocked"
+    assert exit_result["status"] == "ok"
+    assert [call["side"] for call in calls] == ["buy", "sell"]
+
+
+def test_cancel_tool_allows_distinct_orders_but_blocks_exact_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_cancel_order(order_id, _connection, **_kwargs):  # noqa: ANN001
+        calls.append(order_id)
+        return {"status": "ok", "order_id": order_id}
+
+    monkeypatch.setattr("src.tools.trading_connector_tool.cancel_order", fake_cancel_order)
+    tool = TradingCancelOrderTool()
+
+    first = json.loads(tool.execute(order_id="order-1", connection="alpaca-paper-trade"))
+    duplicate = json.loads(tool.execute(order_id="order-1", connection="alpaca-paper-trade"))
+    second = json.loads(tool.execute(order_id="order-2", connection="alpaca-paper-trade"))
+
+    assert tool.repeatable is True
+    assert first["status"] == "ok"
+    assert duplicate["error_code"] == "duplicate_cancel_request_blocked"
+    assert second["status"] == "ok"
+    assert calls == ["order-1", "order-2"]
 
 
 def test_live_broker_mcp_wrappers_are_hidden_from_agent_registry(monkeypatch: pytest.MonkeyPatch) -> None:
