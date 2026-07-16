@@ -1,0 +1,1679 @@
+# Phase 8 — Latency Budgeter
+
+## Fully Consolidated Final Miro Flowchart
+
+This version includes the final two ledger corrections: a separate immutable `execution_evaluated` event, and component-level latency validation/release as soon as each measurement becomes available. 
+
+---
+
+## 1. Shared observation and cohort classification
+
+```text
+┌──────────────────────────────────────┐
+│                START                 │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ NEW MARKET OBSERVATION / EVENT       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ CREATE OPPORTUNITY IDENTITY          │
+│                                      │
+│ - decision_id                        │
+│ - run_id                             │
+│ - signal_id                          │
+│ - symbol                             │
+│ - side                               │
+│ - strategy_version                   │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ CAPTURE DATA PROVENANCE              │
+│                                      │
+│ - source                             │
+│ - source_capture_at                  │
+│ - observed_at                        │
+│ - timezone                           │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ NORMALISE AVAILABLE TIMESTAMPS       │
+│ TO UTC                               │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ GENERATE RAW STRATEGY SIGNAL         │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ RECORD RAW SIGNAL                    │
+│                                      │
+│ raw_signal_count += 1                │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ COMPUTE SHARED COHORT FLAGS          │
+│                                      │
+│ NON-BLOCKING                         │
+│                                      │
+│ - provenance_valid_for_phase8        │
+│ - data_fresh_for_phase8              │
+│ - strategy_requirements_met          │
+│ - common_phase8_eligible             │
+│                                      │
+│ These flags do not alter baseline    │
+│ execution behaviour.                 │
+└──────────────────┬───────────────────┘
+                   ↓
+          ◇ LATENCY BUDGETER ◇
+               ENABLED?
+             /          \
+           NO            YES
+           ↓              ↓
+```
+
+---
+
+# 2. Disabled baseline branch
+
+```text
+┌──────────────────────────────────────┐
+│ BASELINE MODE                        │
+│                                      │
+│ Preserve original engine behaviour.  │
+│                                      │
+│ Do not apply:                        │
+│ - Phase 8 timestamp rejection        │
+│ - Phase 8 freshness rejection        │
+│ - latency-decay calculation          │
+│ - net-edge buffer gate               │
+│ - Phase 8 order changes              │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ FOLLOW ORIGINAL EXECUTION PATH       │
+│ UNCHANGED                            │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ RECORD ALL ORIGINAL BASELINE         │
+│ ACTIVITY                             │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ PRODUCE TWO BASELINE VIEWS           │
+│                                      │
+│ 1. All original baseline activity    │
+│                                      │
+│ 2. Matched baseline activity where   │
+│    common_phase8_eligible = true      │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ REPORT UNMATCHED INTEGRITY COHORT    │
+│ SEPARATELY                           │
+│                                      │
+│ Baseline may still trade signals     │
+│ that are stale or provenance-invalid │
+│ under Phase 8 definitions.           │
+│                                      │
+│ Do not use this unmatched activity   │
+│ to claim Phase 8 benefit.            │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│          BASELINE BRANCH END         │
+└──────────────────────────────────────┘
+```
+
+---
+
+# 3. Enabled Phase 8 branch
+
+## Pre-decision timestamp and freshness checks
+
+```text
+┌──────────────────────────────────────┐
+│ RECORD decision_at                   │
+│                                      │
+│ Time at which the strategy creates   │
+│ the current trading decision.        │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ PRE-DECISION TIMESTAMP VALIDATION    │
+│                                      │
+│ Validate information available now:  │
+│                                      │
+│ - required provenance exists         │
+│ - timestamps are UTC-normalised      │
+│ - no timestamp is future-dated       │
+│ - observed_at ≤ decision_at          │
+└──────────────────┬───────────────────┘
+                   ↓
+        ◇ PRE-DECISION TIMESTAMPS ◇
+                   VALID?
+              /             \
+            NO               YES
+            ↓                 ↓
+```
+
+### Invalid pre-decision timestamps
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = decision_created        │
+│ decision = REJECT                    │
+│ reason_code =                        │
+│ REJECT_INVALID_TIMESTAMP_ORDER       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ DO NOT SUBMIT ORDER                  │
+│                                      │
+│ Do not fabricate:                    │
+│ - broker acknowledgement             │
+│ - fills                              │
+│ - realised costs                     │
+│ - realised latency                   │
+│ - realised P&L                       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ OPTIONAL                             │
+│ rejected_signal_counterfactual       │
+│                                      │
+│ Run only using the frozen,           │
+│ pre-registered methodology.          │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│          END SIGNAL PATH             │
+└──────────────────────────────────────┘
+```
+
+---
+
+## Provenance duration calculation
+
+```text
+┌──────────────────────────────────────┐
+│ CALCULATE PROVENANCE DURATIONS       │
+│                                      │
+│ data_age_ms =                        │
+│ decision_at - observed_at            │
+│                                      │
+│ ingestion_delay_ms =                 │
+│ source_capture_at - observed_at      │
+│                                      │
+│ processing_delay_ms =                │
+│ decision_at - source_capture_at      │
+└──────────────────┬───────────────────┘
+                   ↓
+          ◇ DATA FRESH ENOUGH? ◇
+              /             \
+            NO               YES
+            ↓                 ↓
+```
+
+### Stale-data path
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = decision_created        │
+│ decision = REJECT                    │
+│ reason_code = REJECT_STALE_DATA      │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ RECORD                               │
+│                                      │
+│ - data_age_ms                        │
+│ - freshness_limit_ms                 │
+│ - provenance fields                  │
+│ - common cohort flags                │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ DO NOT SUBMIT ORDER                  │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ OPTIONAL                             │
+│ rejected_signal_counterfactual       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│          END SIGNAL PATH             │
+└──────────────────────────────────────┘
+```
+
+---
+
+# 4. Shared matched-cohort eligibility
+
+```text
+┌──────────────────────────────────────┐
+│ COMMON PHASE 8 ELIGIBLE?             │
+│                                      │
+│ Frozen shared requirements include:  │
+│                                      │
+│ - identical strategy                 │
+│ - identical universe                 │
+│ - identical capital                  │
+│ - identical dates                    │
+│ - identical sizing rules             │
+│ - identical provenance rules         │
+│ - identical non-budgeter conditions  │
+└──────────────────┬───────────────────┘
+                   ↓
+         ◇ common_phase8_eligible? ◇
+              /                  \
+            NO                    YES
+            ↓                      ↓
+```
+
+### Not in the common cohort
+
+```text
+┌──────────────────────────────────────┐
+│ RECORD AS UNMATCHED OR INELIGIBLE    │
+│                                      │
+│ - retain for audit                   │
+│ - retain for broader reporting       │
+│ - exclude from matched primary       │
+│   Phase 8 denominator                │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│          END SIGNAL PATH             │
+└──────────────────────────────────────┘
+```
+
+### Common eligible signal
+
+```text
+┌──────────────────────────────────────┐
+│ COUNT AS COMMON PHASE 8              │
+│ ELIGIBLE SIGNAL                      │
+│                                      │
+│ common_eligible_count += 1           │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ ESTIMATE GROSS EXPECTED EDGE         │
+│                                      │
+│ gross_edge_bps                       │
+└──────────────────┬───────────────────┘
+                   ↓
+          ◇ gross_edge_bps > 0? ◇
+              /             \
+            NO               YES
+            ↓                 ↓
+```
+
+### Non-positive gross edge
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = decision_created        │
+│ decision = REJECT                    │
+│ reason_code =                        │
+│ REJECT_NONPOSITIVE_GROSS_EDGE        │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ DO NOT SUBMIT ORDER                  │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ OPTIONAL                             │
+│ rejected_signal_counterfactual       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│          END SIGNAL PATH             │
+└──────────────────────────────────────┘
+```
+
+---
+
+# 5. Frozen configuration and prior-only history
+
+```text
+┌──────────────────────────────────────┐
+│ LOAD FROZEN PHASE 8 CONFIGURATION    │
+│                                      │
+│ - config_version                     │
+│ - tau_ms                             │
+│ - latency_percentile                 │
+│ - rolling_history_window             │
+│ - minimum_prior_samples              │
+│ - cold_start_policy                  │
+│ - fallback_p90_latency_ms            │
+│ - freshness_limit_ms                 │
+│ - required_buffer_bps                │
+│ - expiry_policy                      │
+│ - cost assumptions                   │
+│ - outcome horizon                    │
+│ - counterfactual methodology         │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ QUERY LATENCY-HISTORY STORE          │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ APPLY POINT-IN-TIME HISTORY FILTER   │
+│                                      │
+│ A latency component may be used only │
+│ when:                                │
+│                                      │
+│ component_available_at              │
+│ < current decision_at               │
+│                                      │
+│ Exclude:                             │
+│ - current opportunity                │
+│ - future observations                │
+│ - unavailable measurements           │
+│ - affected integrity failures        │
+└──────────────────┬───────────────────┘
+                   ↓
+       ◇ SUFFICIENT VALID HISTORY? ◇
+              /                 \
+            YES                 NO
+            ↓                    ↓
+```
+
+### Rolling prior-only history
+
+```text
+┌──────────────────────────────────────┐
+│ CALCULATE ROLLING DECLARED           │
+│ PERCENTILES                          │
+│                                      │
+│ Example: prior-only p90              │
+│                                      │
+│ latency_estimator_mode =             │
+│ "rolling_prior_only"                 │
+└──────────────────┬───────────────────┘
+                   ↓
+           CONTINUE TO FORECAST
+```
+
+### Cold-start handling
+
+```text
+        ◇ FROZEN FALLBACK AVAILABLE? ◇
+              /                  \
+            YES                  NO
+            ↓                     ↓
+```
+
+```text
+┌──────────────────────────────────────┐
+│ USE FROZEN CONSERVATIVE             │
+│ FALLBACK p90                         │
+│                                      │
+│ latency_estimator_mode =             │
+│ "cold_start_fallback"                │
+└──────────────────┬───────────────────┘
+                   ↓
+           CONTINUE TO FORECAST
+```
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = decision_created        │
+│ decision = DEFER                     │
+│ reason_code = DEFER_COLD_START       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ DEFER IS TERMINAL FOR THIS SIGNAL    │
+│                                      │
+│ - do not submit                      │
+│ - do not wait for a better price     │
+│ - do not reconsider unless a frozen, │
+│   bounded re-evaluation policy       │
+│   already exists                     │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ OPTIONAL                             │
+│ rejected_signal_counterfactual       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│          END SIGNAL PATH             │
+└──────────────────────────────────────┘
+```
+
+---
+
+# 6. Forecast latency
+
+```text
+┌──────────────────────────────────────┐
+│ FORECAST END-TO-END LATENCY          │
+│                                      │
+│ Directly observed:                   │
+│ - data_age_ms                        │
+│                                      │
+│ Measured if available, otherwise     │
+│ conservatively estimated:            │
+│ - decision_latency_ms                │
+│ - risk_processing_latency_ms         │
+│                                      │
+│ Prior-only estimates:                │
+│ - submission_latency_ms              │
+│ - acknowledgement_latency_ms         │
+│ - expected_fill_latency_ms           │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ CALCULATE FORECAST TOTAL LATENCY     │
+│                                      │
+│ forecast_total_latency_ms =          │
+│                                      │
+│ data_age_ms                          │
+│ + forecast_decision_latency_ms       │
+│ + forecast_risk_latency_ms           │
+│ + forecast_submission_latency_ms     │
+│ + forecast_ack_latency_ms            │
+│ + forecast_fill_latency_ms           │
+└──────────────────┬───────────────────┘
+                   ↓
+```
+
+---
+
+# 7. Signal-decay and cost calculation
+
+```text
+┌──────────────────────────────────────┐
+│ CALCULATE SIGNAL DECAY               │
+│                                      │
+│ predicted_decay_factor =             │
+│ exp(-forecast_total_latency_ms       │
+│     / tau_ms)                        │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ CALCULATE EXPECTED EDGE AT FILL      │
+│                                      │
+│ edge_at_fill_bps =                   │
+│ gross_edge_bps                       │
+│ × predicted_decay_factor             │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ ESTIMATE EXECUTION COSTS             │
+│                                      │
+│ Reuse Phase 6/7 cost pipeline:       │
+│                                      │
+│ - fees                               │
+│ - spread                             │
+│ - slippage                           │
+│ - market impact                      │
+│                                      │
+│ Use the same reference-price         │
+│ convention and count each component  │
+│ exactly once.                        │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ CALCULATE TOTAL ESTIMATED COST       │
+│                                      │
+│ estimated_cost_bps =                 │
+│ fee_bps                              │
+│ + spread_bps                         │
+│ + slippage_bps                       │
+│ + impact_bps                         │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ CALCULATE PREDICTED NET EDGE         │
+│                                      │
+│ net_edge_bps =                       │
+│ edge_at_fill_bps                     │
+│ - estimated_cost_bps                 │
+└──────────────────┬───────────────────┘
+                   ↓
+       ◇ net_edge_bps strictly greater ◇
+          than required_buffer_bps?
+              /                  \
+            NO                    YES
+            ↓                      ↓
+```
+
+---
+
+# 8. Reject insufficient net edge
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = decision_created        │
+│ decision = REJECT                    │
+│ reason_code =                        │
+│ REJECT_INSUFFICIENT_NET_EDGE         │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ RECORD FROZEN DECISION ECONOMICS     │
+│                                      │
+│ - gross_edge_bps                     │
+│ - forecast latency components        │
+│ - forecast_total_latency_ms          │
+│ - tau_ms                             │
+│ - predicted_decay_factor             │
+│ - edge_at_fill_bps                   │
+│ - estimated cost components          │
+│ - estimated_cost_bps                 │
+│ - net_edge_bps                       │
+│ - required_buffer_bps                │
+│ - estimator mode                     │
+│ - prior sample counts                │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ DO NOT SUBMIT ORDER                  │
+│                                      │
+│ Do not invent:                       │
+│ - broker events                      │
+│ - fills                              │
+│ - realised costs                     │
+│ - realised latency                   │
+│ - realised P&L                       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ START                                │
+│ rejected_signal_counterfactual       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│          END ORDER PATH              │
+└──────────────────────────────────────┘
+```
+
+---
+
+# 9. Allow decision and existing execution engine
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = decision_created        │
+│ decision = ALLOW                     │
+│ reason_code =                        │
+│ ALLOW_NET_EDGE_ABOVE_BUFFER          │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ COUNT AS BUDGETER-APPROVED SIGNAL    │
+│                                      │
+│ approved_signal_count += 1           │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ PASS APPROVED OPPORTUNITY TO         │
+│ EXISTING EXECUTION ENGINE            │
+│                                      │
+│ Phase 8 does not replace:            │
+│                                      │
+│ - position sizing                    │
+│ - portfolio controls                 │
+│ - participation limits               │
+│ - volume constraints                 │
+│ - market/limit order logic           │
+│ - IOC/FOK/GTC behaviour              │
+│ - partial-fill logic                 │
+│ - expiry/cancellation rules          │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ EXISTING ENGINE DETERMINES           │
+│                                      │
+│ - permitted quantity                 │
+│ - order type                         │
+│ - limit price                        │
+│ - participation limit                │
+│ - expiry_at                          │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ SUBMIT ORDER                         │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = order_submitted         │
+│                                      │
+│ Record:                              │
+│ - submitted_at                       │
+│ - submitted quantity                 │
+│ - order type                         │
+│ - expiry_at                          │
+│ - decision_id                        │
+└──────────────────┬───────────────────┘
+                   ↓
+```
+
+---
+
+# 10. Validate and release submission latency component
+
+```text
+┌──────────────────────────────────────┐
+│ VALIDATE SUBMISSION-LATENCY          │
+│ COMPONENT                            │
+│                                      │
+│ Minimum condition:                   │
+│ decision_at ≤ submitted_at           │
+└──────────────────┬───────────────────┘
+                   ↓
+       ◇ SUBMISSION COMPONENT VALID? ◇
+              /                 \
+            NO                   YES
+            ↓                     ↓
+```
+
+```text
+┌──────────────────────────────────────┐
+│ FLAG SUBMISSION COMPONENT           │
+│ INTEGRITY FAILURE                    │
+│                                      │
+│ - retain event for audit             │
+│ - exclude this component from        │
+│   latency-history calculations       │
+└──────────────────────────────────────┘
+```
+
+```text
+┌──────────────────────────────────────┐
+│ RELEASE SUBMISSION-LATENCY          │
+│ OBSERVATION TO PRIOR-ONLY STORE      │
+│                                      │
+│ component_available_at =             │
+│ submitted_at                         │
+│                                      │
+│ Future decisions may use it only if: │
+│ submitted_at < future decision_at    │
+└──────────────────────────────────────┘
+```
+
+---
+
+# 11. Broker acknowledgement
+
+```text
+          ◇ BROKER ACKNOWLEDGEMENT? ◇
+              /                  \
+            YES              NO / UNSUPPORTED
+            ↓                     ↓
+```
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = broker_acknowledged     │
+│ acknowledged_at = actual timestamp   │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ VALIDATE ACK-LATENCY COMPONENT       │
+│                                      │
+│ Minimum condition:                   │
+│ submitted_at ≤ acknowledged_at       │
+└──────────────────┬───────────────────┘
+                   ↓
+        ◇ ACK COMPONENT VALID? ◇
+             /               \
+           NO                 YES
+           ↓                   ↓
+```
+
+```text
+┌──────────────────────────────────────┐
+│ FLAG ACK COMPONENT INTEGRITY FAILURE │
+│                                      │
+│ Retain evidence but exclude this     │
+│ component from estimators.           │
+└──────────────────────────────────────┘
+```
+
+```text
+┌──────────────────────────────────────┐
+│ RELEASE ACK-LATENCY OBSERVATION      │
+│                                      │
+│ component_available_at =             │
+│ acknowledged_at                      │
+│                                      │
+│ Usable only when:                    │
+│ acknowledged_at < future decision_at │
+└──────────────────────────────────────┘
+```
+
+```text
+┌──────────────────────────────────────┐
+│ acknowledged_at = null              │
+│                                      │
+│ Do not fabricate an acknowledgement │
+│ or acknowledgement latency.          │
+└──────────────────────────────────────┘
+```
+
+---
+
+# 12. Monitor order lifecycle
+
+```text
+┌──────────────────────────────────────┐
+│ MONITOR ORDER LIFECYCLE              │
+│                                      │
+│ - current time                       │
+│ - expiry_at                          │
+│ - fill events                        │
+│ - filled quantity                    │
+│ - unfilled quantity                  │
+│ - fill prices                        │
+│ - adverse movement                   │
+└──────────────────┬───────────────────┘
+                   ↓
+             ◇ FILL RECEIVED? ◇
+                /         \
+              YES          NO
+              ↓             ↓
+```
+
+---
+
+# 13. Fill received path
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = fill_received           │
+│                                      │
+│ Record:                              │
+│ - fill timestamp                     │
+│ - fill quantity                      │
+│ - fill price                         │
+│ - cumulative filled quantity         │
+│ - unfilled quantity                  │
+└──────────────────┬───────────────────┘
+                   ↓
+          ◇ IS THIS THE FIRST FILL? ◇
+                /             \
+              YES              NO
+              ↓                ↓
+```
+
+### First-fill latency component
+
+```text
+┌──────────────────────────────────────┐
+│ SET first_fill_at                    │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ VALIDATE FIRST-FILL LATENCY          │
+│ COMPONENT                            │
+│                                      │
+│ Minimum condition:                   │
+│ submitted_at ≤ first_fill_at         │
+└──────────────────┬───────────────────┘
+                   ↓
+       ◇ FIRST-FILL COMPONENT VALID? ◇
+              /                  \
+            NO                    YES
+            ↓                      ↓
+```
+
+```text
+┌──────────────────────────────────────┐
+│ FLAG FIRST-FILL COMPONENT           │
+│ INTEGRITY FAILURE                    │
+│                                      │
+│ Retain evidence but exclude this     │
+│ component from estimators.           │
+└──────────────────────────────────────┘
+```
+
+```text
+┌──────────────────────────────────────┐
+│ RELEASE FIRST-FILL LATENCY TO STORE  │
+│                                      │
+│ component_available_at =             │
+│ first_fill_at                        │
+│                                      │
+│ Usable only when:                    │
+│ first_fill_at < future decision_at   │
+└──────────────────────────────────────┘
+```
+
+Then continue:
+
+```text
+             ◇ ORDER FULLY FILLED? ◇
+                /               \
+              YES               NO
+              ↓                  ↓
+```
+
+---
+
+# 14. Fully filled path
+
+```text
+┌──────────────────────────────────────┐
+│ SET final_fill_at                    │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ VALIDATE FINAL-FILL LATENCY          │
+│ COMPONENT                            │
+│                                      │
+│ Minimum condition:                   │
+│ first_fill_at ≤ final_fill_at        │
+└──────────────────┬───────────────────┘
+                   ↓
+       ◇ FINAL-FILL COMPONENT VALID? ◇
+              /                  \
+            NO                    YES
+            ↓                      ↓
+```
+
+```text
+┌──────────────────────────────────────┐
+│ FLAG FINAL-FILL COMPONENT           │
+│ INTEGRITY FAILURE                    │
+│                                      │
+│ Retain evidence but exclude this     │
+│ component from estimators.           │
+└──────────────────────────────────────┘
+```
+
+```text
+┌──────────────────────────────────────┐
+│ RELEASE FINAL-FILL LATENCY TO STORE  │
+│                                      │
+│ component_available_at =             │
+│ final_fill_at                        │
+└──────────────────────────────────────┘
+```
+
+Then:
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = order_terminal          │
+│ terminal_state = FULLY_FILLED        │
+└──────────────────┬───────────────────┘
+                   ↓
+        TERMINAL CROSS-EVENT AUDIT
+```
+
+---
+
+# 15. Partial-fill path
+
+```text
+┌──────────────────────────────────────┐
+│ PRESERVE FILLED QUANTITY             │
+│                                      │
+│ Never cancel or erase completed      │
+│ fills.                               │
+└──────────────────┬───────────────────┘
+                   ↓
+            ◇ EXPIRY REACHED? ◇
+               /             \
+             NO               YES
+             ↓                 ↓
+```
+
+```text
+┌──────────────────────────────────────┐
+│ CONTINUE MONITORING                  │
+└──────────────────┬───────────────────┘
+                   └────────────→ MONITOR ORDER
+```
+
+```text
+┌──────────────────────────────────────┐
+│ CANCEL ONLY UNFILLED REMAINDER       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = order_terminal          │
+│ terminal_state =                     │
+│ PARTIALLY_FILLED_EXPIRED             │
+│                                      │
+│ reason_code =                        │
+│ EXPIRE_UNFILLED_REMAINDER            │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ DO NOT                               │
+│                                      │
+│ - reprice                            │
+│ - chase                              │
+│ - resubmit the same stale signal     │
+└──────────────────┬───────────────────┘
+                   ↓
+        TERMINAL CROSS-EVENT AUDIT
+```
+
+---
+
+# 16. No-fill path
+
+```text
+             ◇ EXPIRY REACHED? ◇
+                /           \
+              NO             YES
+              ↓               ↓
+```
+
+```text
+┌──────────────────────────────────────┐
+│ CONTINUE MONITORING                  │
+└──────────────────┬───────────────────┘
+                   └────────────→ MONITOR ORDER
+```
+
+```text
+┌──────────────────────────────────────┐
+│ CANCEL ENTIRE UNFILLED ORDER         │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = order_terminal          │
+│ terminal_state = EXPIRED_UNFILLED    │
+│ execution_outcome = NO_FILL          │
+│ reason_code =                        │
+│ EXPIRE_UNFILLED_REMAINDER            │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ RECORD                               │
+│                                      │
+│ - executed quantity = 0              │
+│ - unfilled quantity = full quantity  │
+│ - realised fill latency = null       │
+│ - realised execution cost = 0        │
+│   unless a real cancellation fee     │
+│   exists                             │
+│ - realised trade P&L = null          │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ MARK AS APPROVED-BUT-UNFILLED        │
+│                                      │
+│ This is not a rejected signal.       │
+│                                      │
+│ At the frozen outcome horizon,       │
+│ optionally calculate:                │
+│                                      │
+│ approved_unfilled_counterfactual     │
+│                                      │
+│ Label as:                            │
+│ simulated unfilled-approved-         │
+│ opportunity diagnostic              │
+└──────────────────┬───────────────────┘
+                   ↓
+        TERMINAL CROSS-EVENT AUDIT
+```
+
+---
+
+# 17. Terminal cross-event integrity audit
+
+```text
+┌──────────────────────────────────────┐
+│ RUN FULL LIFECYCLE CHRONOLOGY AUDIT  │
+│                                      │
+│ Validate existing timestamps:        │
+│                                      │
+│ - observed_at ≤ decision_at          │
+│ - decision_at ≤ submitted_at         │
+│ - submitted_at ≤ acknowledged_at     │
+│   when acknowledgement exists        │
+│ - submitted_at ≤ first_fill_at       │
+│   when a fill exists                 │
+│ - first_fill_at ≤ final_fill_at       │
+│   when final fill exists             │
+│ - submitted_at ≤ terminal_at         │
+└──────────────────┬───────────────────┘
+                   ↓
+       ◇ FULL LIFECYCLE VALID? ◇
+              /              \
+            NO                YES
+            ↓                  ↓
+```
+
+### Cross-event failure
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type =                         │
+│ lifecycle_integrity_failure          │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ RECORD                               │
+│                                      │
+│ - invalid sequence                   │
+│ - affected timestamps                │
+│ - affected latency components        │
+│ - related event IDs                  │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ RETAIN ALL EVENTS FOR                │
+│                                      │
+│ - audit                              │
+│ - reporting                          │
+│ - investigation                      │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ EXCLUDE ONLY AFFECTED INVALID        │
+│ COMPONENTS FROM                      │
+│                                      │
+│ - future latency estimators          │
+│ - forecast calibration               │
+│ - decay calibration                  │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ DO NOT RETROACTIVELY CHANGE          │
+│ THE ORIGINAL ALLOW DECISION          │
+└──────────────────┬───────────────────┘
+                   ↓
+       EXECUTION EVALUATION PATH
+```
+
+### Valid lifecycle
+
+```text
+┌──────────────────────────────────────┐
+│ MARK FULL LIFECYCLE AUDIT VALID      │
+└──────────────────┬───────────────────┘
+                   ↓
+       EXECUTION EVALUATION PATH
+```
+
+Each latency component is validated and made available after its own completion event. The later terminal validation acts as a cross-event audit and may invalidate only the affected components without rewriting the original decision. 
+
+---
+
+# 18. Execution evaluation
+
+```text
+┌──────────────────────────────────────┐
+│ CALCULATE REALISED EXECUTION         │
+│ MEASUREMENTS                         │
+│                                      │
+│ For executed quantity only:          │
+│                                      │
+│ - realised decision latency          │
+│ - realised submission latency        │
+│ - realised acknowledgement latency   │
+│ - realised first-fill latency        │
+│ - realised final-fill latency        │
+│ - realised_total_latency_ms          │
+│ - actual fees                        │
+│ - actual spread result               │
+│ - actual slippage                    │
+│ - actual impact proxy                │
+│ - implementation shortfall           │
+│ - realised execution cost            │
+│ - executed quantity                  │
+│ - unfilled quantity                  │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = execution_evaluated     │
+│                                      │
+│ execution_outcome = one of:          │
+│                                      │
+│ - FULLY_FILLED                       │
+│ - PARTIALLY_FILLED_EXPIRED           │
+│ - NO_FILL                            │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ DO NOT YET CLAIM                     │
+│                                      │
+│ - final strategy return              │
+│ - realised trade P&L                 │
+│ - realised net strategy outcome      │
+│                                      │
+│ These require the frozen evaluation  │
+│ horizon or the actual strategy exit. │
+└──────────────────┬───────────────────┘
+                   ↓
+```
+
+`order_terminal` records that the order lifecycle ended; `execution_evaluated` records actual execution quality and costs; `outcome_evaluated` later records the strategy result. 
+
+---
+
+# 19. Outcome-horizon path
+
+```text
+       ◇ OUTCOME HORIZON OR STRATEGY ◇
+                 EXIT OCCURRED?
+              /               \
+            NO                 YES
+            ↓                   ↓
+```
+
+```text
+┌──────────────────────────────────────┐
+│ WAIT FOR FROZEN OUTCOME HORIZON      │
+└──────────────────┬───────────────────┘
+                   └────────────→ CHECK AGAIN
+```
+
+```text
+┌──────────────────────────────────────┐
+│ CALCULATE STRATEGY OUTCOME           │
+│                                      │
+│ - fixed-horizon return or exit return │
+│ - realised strategy outcome          │
+│ - realised net outcome               │
+│ - observed post-fill result          │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ COMPARE FORECAST WITH REALITY        │
+│                                      │
+│ - forecast vs realised latency       │
+│ - estimated vs realised cost         │
+│ - predicted edge-at-fill vs outcome  │
+│ - predicted net edge vs net outcome  │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = outcome_evaluated       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ DO NOT ALTER FROZEN HOLDOUT VALUES   │
+│                                      │
+│ - tau_ms                             │
+│ - percentile                         │
+│ - buffer                             │
+│ - costs                              │
+│ - fallback                           │
+│ - expiry policy                      │
+│ - outcome horizon                    │
+└──────────────────┬───────────────────┘
+                   ↓
+            REPORTING PATH
+```
+
+---
+
+# 20. Rejected or deferred signal counterfactual
+
+```text
+┌──────────────────────────────────────┐
+│ REJECTED OR DEFERRED OPPORTUNITY     │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ WAIT UNTIL THE SAME FROZEN           │
+│ OUTCOME HORIZON                      │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ CALCULATE                            │
+│ rejected_signal_counterfactual       │
+│                                      │
+│ Use:                                 │
+│ - original decision reference price  │
+│ - identical outcome horizon          │
+│ - frozen cost assumptions            │
+│ - documented shadow methodology      │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ LABEL AS SIMULATED DIAGNOSTIC        │
+│                                      │
+│ Not:                                 │
+│ - actual execution                   │
+│ - actual fill                        │
+│ - realised trade                     │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = outcome_evaluated       │
+│ counterfactual_type =                │
+│ rejected_signal_counterfactual       │
+└──────────────────┬───────────────────┘
+                   ↓
+            REPORTING PATH
+```
+
+---
+
+# 21. Approved but unfilled counterfactual
+
+```text
+┌──────────────────────────────────────┐
+│ APPROVED BUT EXPIRED UNFILLED        │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ WAIT UNTIL THE SAME FROZEN           │
+│ OUTCOME HORIZON                      │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ OPTIONALLY CALCULATE                 │
+│ approved_unfilled_counterfactual     │
+│                                      │
+│ Use:                                 │
+│ - same reference convention          │
+│ - same horizon                       │
+│ - same frozen cost assumptions       │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ LABEL AS                             │
+│                                      │
+│ simulated unfilled-approved-         │
+│ opportunity diagnostic              │
+│                                      │
+│ Not a rejected signal.               │
+│ Not a realised trade.                │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ APPEND EVENT                         │
+│                                      │
+│ event_type = outcome_evaluated       │
+│ counterfactual_type =                │
+│ approved_unfilled_counterfactual     │
+└──────────────────┬───────────────────┘
+                   ↓
+            REPORTING PATH
+```
+
+---
+
+# 22. Append-only event ledger
+
+```text
+┌──────────────────────────────────────┐
+│ APPEND-ONLY EVENT LEDGER             │
+│                                      │
+│ Final event types:                   │
+│                                      │
+│ 1. decision_created                  │
+│ 2. order_submitted                   │
+│ 3. broker_acknowledged               │
+│ 4. fill_received                     │
+│ 5. order_terminal                    │
+│ 6. lifecycle_integrity_failure       │
+│ 7. execution_evaluated               │
+│ 8. outcome_evaluated                 │
+│                                      │
+│ Never overwrite an existing event.   │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│ BUILD DERIVED DECISION SUMMARY       │
+│                                      │
+│ Reconstruct each opportunity using:  │
+│                                      │
+│ decision_id                          │
+│                                      │
+│ Never mutate the original forecast   │
+│ after the outcome is known.          │
+└──────────────────┬───────────────────┘
+                   ↓
+```
+
+---
+
+# 23. Four opportunity counts
+
+```text
+┌──────────────────────────────────────┐
+│ REPORT FOUR OPPORTUNITY LEVELS       │
+│                                      │
+│ 1. RAW SIGNALS                       │
+│    All strategy signals generated.   │
+│                                      │
+│ 2. COMMON PHASE 8 ELIGIBLE SIGNALS   │
+│    Shared frozen matched cohort.     │
+│                                      │
+│ 3. BUDGETER-APPROVED SIGNALS         │
+│    Common eligible signals that pass │
+│    the net-edge gate.                │
+│                                      │
+│ 4. EXECUTED ORDERS                   │
+│    Approved orders receiving at      │
+│    least one actual fill.            │
+└──────────────────┬───────────────────┘
+                   ↓
+```
+
+---
+
+# 24. Phase 8 reporting metrics
+
+```text
+┌──────────────────────────────────────┐
+│ GENERATE PHASE 8 METRICS             │
+│                                      │
+│ Opportunity flow:                    │
+│ - raw signal count                   │
+│ - common eligible count              │
+│ - approved count                     │
+│ - rejected count                     │
+│ - deferred count                     │
+│                                      │
+│ Execution:                           │
+│ - submitted order count              │
+│ - executed order count               │
+│ - no-fill count                      │
+│ - partial-fill count                 │
+│ - expiry count                       │
+│ - retention rate                     │
+│                                      │
+│ Economics:                           │
+│ - net expectancy per common          │
+│   eligible signal                    │
+│ - net expectancy per executed order  │
+│ - turnover                           │
+│ - exposure                           │
+│ - maximum drawdown                   │
+│ - concentration                      │
+│                                      │
+│ Execution quality:                   │
+│ - p90 slippage                       │
+│ - implementation shortfall           │
+│ - actual execution costs             │
+│                                      │
+│ Calibration:                         │
+│ - latency forecast error             │
+│ - cost forecast error                │
+│ - edge forecast error                │
+│                                      │
+│ Diagnostics:                         │
+│ - rejected-signal counterfactuals    │
+│ - approved-unfilled diagnostics      │
+│ - reason-code distribution           │
+│ - lifecycle-integrity failures       │
+└──────────────────┬───────────────────┘
+                   ↓
+```
+
+---
+
+# 25. Matched controlled experiment
+
+```text
+┌──────────────────────────────────────┐
+│ MATCHED BASELINE VS BUDGETER         │
+│ COMPARISON                           │
+│                                      │
+│ Both matched arms must use identical:│
+│                                      │
+│ - common eligible signals            │
+│ - strategy                           │
+│ - universe                           │
+│ - dates                              │
+│ - capital                            │
+│ - sizing rules                       │
+│ - participation rules                │
+│ - order model                        │
+│ - cost model                         │
+│ - evaluation horizon                 │
+│                                      │
+│ Only the Phase 8 gate may differ.     │
+└──────────────────┬───────────────────┘
+                   ↓
+       ◇ SAME COMMON ELIGIBLE ◇
+           OPPORTUNITY SET?
+             /            \
+           NO              YES
+           ↓                ↓
+```
+
+### Invalid comparison
+
+```text
+┌──────────────────────────────────────┐
+│ EXPERIMENT INVALID                   │
+│                                      │
+│ - repair cohort matching             │
+│ - do not claim improvement           │
+│ - rerun under frozen rules           │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│                END                   │
+└──────────────────────────────────────┘
+```
+
+---
+
+# 26. Pre-registered holdout decision
+
+```text
+┌──────────────────────────────────────┐
+│ APPLY PRE-REGISTERED HOLDOUT RULES   │
+└──────────────────┬───────────────────┘
+                   ↓
+       ◇ BETTER FROZEN OOS NET ◇
+         EXPECTANCY PER COMMON
+          ELIGIBLE SIGNAL AND
+         ALL CONSTRAINTS PASS?
+             /            \
+           YES              NO
+           ↓                ↓
+```
+
+---
+
+## GO
+
+```text
+┌──────────────────────────────────────┐
+│ GO                                   │
+│                                      │
+│ Required evidence:                   │
+│                                      │
+│ - improved frozen OOS net expectancy │
+│ - acceptable retention               │
+│ - drawdown constraint passed         │
+│ - concentration constraint passed    │
+│ - execution quality did not worsen   │
+│ - nearby validation settings agree   │
+│ - credible provenance evidence       │
+│ - credible cost evidence             │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│                END                   │
+└──────────────────────────────────────┘
+```
+
+---
+
+## REVISE or REJECT
+
+```text
+       ◇ DIRECTIONAL BENEFIT BUT ◇
+          WEAK CALIBRATION,
+        ROBUSTNESS, RETENTION,
+       REGIME COVERAGE OR RELIABILITY?
+             /             \
+           YES              NO
+           ↓                 ↓
+```
+
+### REVISE
+
+```text
+┌──────────────────────────────────────┐
+│ REVISE                               │
+│                                      │
+│ Directional benefit exists, but the  │
+│ evidence is insufficient for a       │
+│ robust deployment conclusion.        │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│                END                   │
+└──────────────────────────────────────┘
+```
+
+### REJECT
+
+```text
+┌──────────────────────────────────────┐
+│ REJECT                               │
+│                                      │
+│ Valid negative result when:          │
+│                                      │
+│ - no robust matched-cohort OOS       │
+│   improvement exists                 │
+│ - evidence quality is insufficient   │
+│ - benefits disappear under nearby    │
+│   settings                           │
+│ - apparent gains mainly result from  │
+│   excessive rejection               │
+│ - calibration is unreliable          │
+└──────────────────┬───────────────────┘
+                   ↓
+┌──────────────────────────────────────┐
+│                END                   │
+└──────────────────────────────────────┘
+```
+
+---
+
+# Frozen provenance definitions
+
+```text
+observed_at
+Time represented by the observation itself.
+
+Examples:
+- exchange event timestamp
+- quote timestamp
+- historical bar-close timestamp
+
+
+source_capture_at
+Time AgentLarry's data adapter received,
+downloaded or exposed the observation
+to the strategy.
+
+
+decision_at
+Time the strategy generated the decision.
+
+
+data_age_ms
+decision_at - observed_at
+
+
+ingestion_delay_ms
+source_capture_at - observed_at
+
+
+processing_delay_ms
+decision_at - source_capture_at
+```
+
+For historical OHLCV, describe the result as **simulated bar-level execution delay**, not exchange-grade microstructure latency.
+
+---
+
+# Final system architecture
+
+```text
+SHARED OBSERVATION AND COHORT CLASSIFIER
+                    ↓
+        ┌───────────┴───────────┐
+        ↓                       ↓
+UNCHANGED BASELINE        PHASE 8 GATE
+        │                       │
+        └───────────┬───────────┘
+                    ↓
+       EXISTING EXECUTION ENGINE
+                    ↓
+       APPEND-ONLY EVENT LEDGER
+                    ↓
+       DERIVED DECISION SUMMARY
+                    ↓
+       MATCHED RESEARCH REPORTING
+                    ↓
+           GO / REVISE / REJECT
+```
+
+This is now the complete frozen v1 architecture: shared cohort classification, unchanged baseline, optional Phase 8 gate, existing execution system, immutable lifecycle evidence, separate execution and outcome evaluation, matched reporting and frozen holdout decisions. 
+
+## Miro visual layout
+
+Use these lanes:
+
+1. **Shared observation and cohort layer**
+2. **Baseline branch**
+3. **Phase 8 decision gate**
+4. **Existing execution engine**
+5. **Component-level latency history**
+6. **Append-only event ledger**
+7. **Execution and outcome evaluation**
+8. **Matched research and final decision**
+
+Use:
+
+* **Diamonds:** decision points
+* **Rectangles:** calculations and actions
+* **Document shapes:** immutable events
+* **Database shapes:** prior-only history and event ledger
+* **Red:** reject, defer and invalid experiment
+* **Green:** allow and GO
+* **Orange:** execution, expiry and partial fills
+* **Blue:** shared observation and forecasting
+* **Grey:** unchanged baseline
+* **Purple:** calibration, reporting and counterfactuals
