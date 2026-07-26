@@ -118,7 +118,7 @@ def _load_llm_providers() -> List[LLMProviderOption]:
 
 LLM_PROVIDERS = _load_llm_providers()
 LLM_PROVIDER_BY_NAME = {provider.name: provider for provider in LLM_PROVIDERS}
-LLM_REASONING_EFFORTS = {"", "low", "medium", "high", "max"}
+LLM_REASONING_EFFORTS = {"", "none", "low", "medium", "high", "max"}
 LLM_API_KEY_PLACEHOLDERS = {"", "sk-or-v1-your-key-here", "sk-xxx", "xxx", "gsk_xxx"}
 TUSHARE_TOKEN_PLACEHOLDERS = {"", "your-tushare-token"}
 
@@ -259,7 +259,8 @@ def _sync_runtime_env(provider: LLMProviderOption, updates: Dict[str, str]) -> N
             os.environ.pop(key, None)
 
     if provider.api_key_env:
-        key_value = os.environ.get(provider.api_key_env, "")  # noqa: env-gate — dynamic provider api_key_env
+        # The provider schema determines the environment-variable name.
+        key_value = os.environ.get(provider.api_key_env, "")
         if host._is_configured_secret(key_value, LLM_API_KEY_PLACEHOLDERS):
             os.environ["OPENAI_API_KEY"] = key_value
         else:
@@ -269,7 +270,8 @@ def _sync_runtime_env(provider: LLMProviderOption, updates: Dict[str, str]) -> N
     else:
         os.environ["OPENAI_API_KEY"] = "ollama"
 
-    base_url = os.environ.get(provider.base_url_env, "")  # noqa: env-gate — dynamic provider base_url_env
+    # The provider schema determines the environment-variable name.
+    base_url = os.environ.get(provider.base_url_env, "")
     if base_url:
         os.environ["OPENAI_API_BASE"] = base_url
         os.environ["OPENAI_BASE_URL"] = base_url
@@ -303,10 +305,7 @@ def _persist_settings_updates(updates: Dict[str, str]) -> Dict[str, str]:
     except OSError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "Unable to save settings; check ownership and permissions for "
-                "~/.vibe-trading/.env"
-            ),
+            detail=("Unable to save settings; check ownership and permissions for ~/.vibe-trading/.env"),
         ) from exc
     return host._read_env_values(target)
 
@@ -359,15 +358,11 @@ def register_settings_routes(
         provider_name = payload.provider.strip().lower()
         provider = LLM_PROVIDER_BY_NAME.get(provider_name)
         if provider is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported LLM provider"
-            )
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported LLM provider")
 
         model_name = payload.model_name.strip()
         if not model_name:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="Model name is required"
-            )
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Model name is required")
 
         if payload.temperature < 0 or payload.temperature > 2:
             raise HTTPException(
@@ -379,22 +374,18 @@ def register_settings_routes(
         if reasoning_effort not in LLM_REASONING_EFFORTS:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Reasoning effort must be low, medium, high, or max",
+                detail="Reasoning effort must be none, low, medium, high, or max",
             )
 
         current_values = _read_settings_env_values()
-        base_url = (
-            payload.base_url if payload.base_url is not None else provider.default_base_url
-        ).strip()
+        base_url = (payload.base_url if payload.base_url is not None else provider.default_base_url).strip()
         if provider.auth_type == "oauth":
             try:
                 from src.providers.openai_codex import validate_codex_base_url
 
                 base_url = validate_codex_base_url(base_url)
             except ValueError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-                ) from exc
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         updates: Dict[str, str] = {
             "LANGCHAIN_PROVIDER": provider.name,
             "LANGCHAIN_MODEL_NAME": model_name,
@@ -412,9 +403,7 @@ def register_settings_routes(
             elif payload.api_key is not None and payload.api_key.strip():
                 api_key = payload.api_key.strip()
                 updates[provider.api_key_env] = (
-                    api_key
-                    if host_ref._is_configured_secret(api_key, LLM_API_KEY_PLACEHOLDERS)
-                    else ""
+                    api_key if host_ref._is_configured_secret(api_key, LLM_API_KEY_PLACEHOLDERS) else ""
                 )
             elif provider.api_key_env in current_values and host_ref._is_configured_secret(
                 current_values[provider.api_key_env],
@@ -464,6 +453,4 @@ def register_settings_routes(
                 os.environ.pop("TUSHARE_TOKEN", None)
             reset_env_config()
 
-        return _build_data_source_settings_response(
-            saved_values if updates else _read_settings_env_values()
-        )
+        return _build_data_source_settings_response(saved_values if updates else _read_settings_env_values())

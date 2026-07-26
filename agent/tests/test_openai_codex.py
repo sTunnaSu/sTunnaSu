@@ -18,7 +18,7 @@ from src.providers.openai_codex import (
 )
 
 
-DEFAULT_CODEX_MODEL = "openai-codex/gpt-5.4"
+DEFAULT_CODEX_MODEL = "openai-codex/gpt-5.6-sol"
 
 
 def test_provider_default_model_matches_live_codex_account_path() -> None:
@@ -51,16 +51,18 @@ def test_build_llm_returns_codex_adapter(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_codex_body_strips_provider_prefix_and_converts_tools() -> None:
     adapter = OpenAICodexLLM(model=DEFAULT_CODEX_MODEL)
 
-    body = adapter.bind_tools([
-        {
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Run a shell command",
-                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
-            },
-        }
-    ])._body(
+    body = adapter.bind_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Run a shell command",
+                    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                },
+            }
+        ]
+    )._body(
         [
             {"role": "system", "content": "You are careful."},
             {"role": "user", "content": "Say hi."},
@@ -68,11 +70,20 @@ def test_codex_body_strips_provider_prefix_and_converts_tools() -> None:
         stream=True,
     )
 
-    assert _strip_model_prefix(DEFAULT_CODEX_MODEL) == "gpt-5.4"
-    assert body["model"] == "gpt-5.4"
+    assert _strip_model_prefix(DEFAULT_CODEX_MODEL) == "gpt-5.6-sol"
+    assert body["model"] == "gpt-5.6-sol"
     assert body["instructions"] == "You are careful."
     assert body["tools"][0]["name"] == "bash"
     assert body["input"][0]["content"][0]["text"] == "Say hi."
+
+
+def test_codex_body_preserves_explicit_none_reasoning_effort() -> None:
+    body = OpenAICodexLLM(
+        model=DEFAULT_CODEX_MODEL,
+        reasoning_effort="none",
+    )._body([{"role": "user", "content": "Say hi."}], stream=True)
+
+    assert body["reasoning"] == {"effort": "none"}
 
 
 def test_missing_codex_token_raises_login_hint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -92,20 +103,24 @@ def test_missing_codex_token_raises_login_hint(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_sse_events_parse_text_and_function_calls() -> None:
-    events = list(_events_from_lines([
-        'data: {"type":"response.output_text.delta","delta":"Hi"}',
-        "",
-        'data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"bash","arguments":""}}',
-        "",
-        'data: {"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"{\\"command\\":\\"pw"}',
-        "",
-        'data: {"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"d\\"}"}',
-        "",
-        'data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1"}}',
-        "",
-        "data: [DONE]",
-        "",
-    ]))
+    events = list(
+        _events_from_lines(
+            [
+                'data: {"type":"response.output_text.delta","delta":"Hi"}',
+                "",
+                'data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"bash","arguments":""}}',
+                "",
+                'data: {"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"{\\"command\\":\\"pw"}',
+                "",
+                'data: {"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"d\\"}"}',
+                "",
+                'data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1"}}',
+                "",
+                "data: [DONE]",
+                "",
+            ]
+        )
+    )
 
     chunks = list(_message_chunks_from_events(events))
 

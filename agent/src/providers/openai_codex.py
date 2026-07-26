@@ -11,12 +11,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 from urllib.parse import urlparse
 
 from src.config.accessor import get_env_config
+from src.providers.codex_credentials import CodexCredentialStore
 
 try:
     import httpx
@@ -53,9 +54,8 @@ class CodexAIMessage:
             "finish_reason",
             self.response_metadata.get("finish_reason", "stop"),
         )
-        reasoning = (
-            self.additional_kwargs.get("reasoning_content", "")
-            + other.additional_kwargs.get("reasoning_content", "")
+        reasoning = self.additional_kwargs.get("reasoning_content", "") + other.additional_kwargs.get(
+            "reasoning_content", ""
         )
         return CodexAIMessage(
             content=(self.content or "") + (other.content or ""),
@@ -71,30 +71,25 @@ def login_openai_codex(
 ) -> Any:
     """Run interactive ChatGPT/Codex OAuth login and persist the token."""
     try:
-        from oauth_cli_kit import get_token, login_oauth_interactive
+        from oauth_cli_kit import login_oauth_interactive  # type: ignore[import-untyped]
+        from oauth_cli_kit.providers import OPENAI_CODEX_PROVIDER  # type: ignore[import-untyped]
     except ImportError as exc:
         raise RuntimeError("oauth-cli-kit is not installed. Run: pip install oauth-cli-kit") from exc
 
-    token = None
-    try:
-        token = get_token()
-    except Exception:
-        pass
-    if token and getattr(token, "access", None):
-        return token
-    return login_oauth_interactive(print_fn=print_fn or print, prompt_fn=prompt_fn or input)
+    # Always perform the interactive exchange. A revoked-but-not-expired token
+    # must not be reported as a successful new login.
+    return login_oauth_interactive(
+        print_fn=print_fn or print,
+        prompt_fn=prompt_fn or input,
+        provider=OPENAI_CODEX_PROVIDER,
+        originator=DEFAULT_ORIGINATOR,
+        storage=CodexCredentialStore(),
+    )
 
 
 def get_openai_codex_login_status() -> Any | None:
     """Return the persisted OAuth token, if available."""
-    try:
-        from oauth_cli_kit import get_token
-    except ImportError:
-        return None
-    try:
-        token = get_token()
-    except Exception:
-        return None
+    token = CodexCredentialStore().load()
     if token and getattr(token, "access", None):
         return token
     return None
@@ -102,19 +97,77 @@ def get_openai_codex_login_status() -> Any | None:
 
 def _get_codex_token() -> Any:
     try:
-        from oauth_cli_kit import get_token
+        from oauth_cli_kit import get_token  # type: ignore[import-untyped]
     except ImportError as exc:
         raise RuntimeError(
             "OpenAI Codex OAuth requires oauth-cli-kit. Install dependencies, then run: "
             "vibe-trading provider login openai-codex"
         ) from exc
     try:
-        token = get_token()
-    except Exception as exc:
-        raise RuntimeError("OpenAI Codex is not logged in. Run: vibe-trading provider login openai-codex") from exc
+        token = get_token(storage=CodexCredentialStore())
+    except Exception:
+        raise RuntimeError(
+            "OpenAI Codex authentication is unavailable. Run: vibe-trading provider login openai-codex"
+        ) from None
     if not (token and getattr(token, "access", None) and getattr(token, "account_id", None)):
         raise RuntimeError("OpenAI Codex is not logged in. Run: vibe-trading provider login openai-codex")
     return token
+
+
+def _redact_error(value: str) -> str:
+    """Remove credential-shaped material from provider errors."""
+    value = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~+\-/=]+", "Bearer [redacted]", value)
+    value = re.sub(
+        r'(?i)(access_token|refresh_token|id_token)\s*[=:]\s*["\']?[^,\s"\'}]+',
+        r"\1=[redacted]",
+        value,
+    )
+    return value[:300]
+
+
+def _response_error(response: Any) -> tuple[str | None, str]:
+    """Return a safe error code/message without echoing response secrets."""
+    raw = response.read().decode("utf-8", "ignore")
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, _redact_error(raw) or "request failed"
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        code = str(error.get("code") or "") or None
+        message = str(error.get("message") or "request failed")
+        return code, _redact_error(message)
+    return None, _redact_error(str(payload))
+
+
+def _refresh_codex_token() -> Any:
+    """Force one refresh using the current refresh token and replace the cache."""
+    try:
+        from oauth_cli_kit.flow import _refresh_token  # type: ignore[import-untyped]
+        from oauth_cli_kit.providers import OPENAI_CODEX_PROVIDER  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise RuntimeError("OpenAI Codex OAuth refresh is unavailable; run the login command") from exc
+
+    storage = CodexCredentialStore()
+    current = storage.load()
+    if not current or not getattr(current, "refresh", None):
+        storage.clear()
+        raise RuntimeError("OpenAI Codex login expired. Run: vibe-trading provider login openai-codex")
+
+    # Do not leave the invalidated access token available to another request.
+    storage.remove_canonical()
+    try:
+        refreshed = _refresh_token(current.refresh, OPENAI_CODEX_PROVIDER)
+        storage.save(refreshed)
+        return storage.load() or refreshed
+    except Exception:
+        storage.clear()
+        raise RuntimeError("OpenAI Codex refresh failed. Run: vibe-trading provider login openai-codex") from None
+
+
+def logout_openai_codex() -> None:
+    """Remove only OpenAI Codex OAuth credentials."""
+    CodexCredentialStore().clear()
 
 
 def validate_codex_base_url(url: str) -> str:
@@ -126,14 +179,8 @@ def validate_codex_base_url(url: str) -> str:
     """
     value = (url or DEFAULT_CODEX_URL).strip().rstrip("/")
     parsed = urlparse(value)
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc != "chatgpt.com"
-        or parsed.path != "/backend-api/codex/responses"
-    ):
-        raise ValueError(
-            "OpenAI Codex OAuth only supports https://chatgpt.com/backend-api/codex/responses"
-        )
+    if parsed.scheme != "https" or parsed.netloc != "chatgpt.com" or parsed.path != "/backend-api/codex/responses":
+        raise ValueError("OpenAI Codex OAuth only supports https://chatgpt.com/backend-api/codex/responses")
     return value
 
 
@@ -200,23 +247,27 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
             input_items.append(_convert_user_message(content))
         elif role == "assistant":
             if isinstance(content, str) and content:
-                input_items.append({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": content}],
-                    "status": "completed",
-                    "id": f"msg_{idx}",
-                })
+                input_items.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": content}],
+                        "status": "completed",
+                        "id": f"msg_{idx}",
+                    }
+                )
             for tool_call in msg.get("tool_calls", []) or []:
                 fn = tool_call.get("function") or {}
                 call_id, item_id = _split_tool_call_id(tool_call.get("id"))
-                input_items.append({
-                    "type": "function_call",
-                    "id": item_id or f"fc_{idx}",
-                    "call_id": call_id or f"call_{idx}",
-                    "name": fn.get("name"),
-                    "arguments": fn.get("arguments") or "{}",
-                })
+                input_items.append(
+                    {
+                        "type": "function_call",
+                        "id": item_id or f"fc_{idx}",
+                        "call_id": call_id or f"call_{idx}",
+                        "name": fn.get("name"),
+                        "arguments": fn.get("arguments") or "{}",
+                    }
+                )
         elif role == "tool":
             call_id, _ = _split_tool_call_id(msg.get("tool_call_id"))
             output = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
@@ -232,12 +283,14 @@ def _convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         if not name:
             continue
         params = fn.get("parameters") or {}
-        converted.append({
-            "type": "function",
-            "name": name,
-            "description": fn.get("description") or "",
-            "parameters": params if isinstance(params, dict) else {},
-        })
+        converted.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": fn.get("description") or "",
+                "parameters": params if isinstance(params, dict) else {},
+            }
+        )
     return converted
 
 
@@ -357,9 +410,7 @@ class OpenAICodexLLM:
         self.timeout = timeout
         self.tools = tools or []
         self.reasoning_effort = reasoning_effort
-        self.codex_url = validate_codex_base_url(
-            codex_url or get_env_config().llm.openai_codex_base_url
-        )
+        self.codex_url = validate_codex_base_url(codex_url or get_env_config().llm.openai_codex_base_url)
 
     def bind_tools(self, tools: list[dict[str, Any]]) -> "OpenAICodexLLM":
         return OpenAICodexLLM(
@@ -388,7 +439,7 @@ class OpenAICodexLLM:
         tools = _convert_tools(self.tools)
         if tools:
             body["tools"] = tools
-        if self.reasoning_effort and self.reasoning_effort.lower() != "none":
+        if self.reasoning_effort:
             body["reasoning"] = {"effort": self.reasoning_effort.lower()}
         return body
 
@@ -396,14 +447,28 @@ class OpenAICodexLLM:
         token = _get_codex_token()
         return _build_headers(str(token.account_id), str(token.access))
 
-    def stream(self, messages: list[dict[str, Any]], config: Optional[dict[str, Any]] = None) -> Iterable[CodexAIMessage]:
+    def stream(
+        self, messages: list[dict[str, Any]], config: Optional[dict[str, Any]] = None
+    ) -> Iterable[CodexAIMessage]:
         timeout = (config or {}).get("timeout") or self.timeout
+        headers = self._headers()
         with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=True) as client:
-            with client.stream("POST", self.codex_url, headers=self._headers(), json=self._body(messages, stream=True)) as response:
-                if response.status_code != 200:
-                    raw = response.read().decode("utf-8", "ignore")
-                    raise RuntimeError(f"OpenAI Codex HTTP {response.status_code}: {raw[:500]}")
-                yield from _message_chunks_from_events(_events_from_lines(response.iter_lines()))
+            for attempt in range(2):
+                with client.stream(
+                    "POST", self.codex_url, headers=headers, json=self._body(messages, stream=True)
+                ) as response:
+                    if response.status_code == 401 and attempt == 0:
+                        code, message = _response_error(response)
+                        if code == "token_invalidated":
+                            refreshed = _refresh_codex_token()
+                            headers = _build_headers(str(refreshed.account_id), str(refreshed.access))
+                            continue
+                        raise RuntimeError(f"OpenAI Codex HTTP 401: {message}")
+                    if response.status_code != 200:
+                        _, message = _response_error(response)
+                        raise RuntimeError(f"OpenAI Codex HTTP {response.status_code}: {message}")
+                    yield from _message_chunks_from_events(_events_from_lines(response.iter_lines()))
+                    return
 
     def invoke(self, messages: list[dict[str, Any]], config: Optional[dict[str, Any]] = None) -> CodexAIMessage:
         accumulated: CodexAIMessage | None = None

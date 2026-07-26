@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -41,7 +42,8 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
 
 def test_get_llm_settings_is_side_effect_free_and_hides_placeholders(
-    client: TestClient, tmp_path: Path,
+    client: TestClient,
+    tmp_path: Path,
 ) -> None:
     response = client.get("/settings/llm")
 
@@ -59,7 +61,9 @@ def test_get_llm_settings_is_side_effect_free_and_hides_placeholders(
 
 @pytest.mark.parametrize("placeholder", ["sk-xxx", "xxx", "gsk_xxx"])
 def test_llm_settings_treat_documented_key_placeholders_as_unconfigured(
-    client: TestClient, tmp_path: Path, placeholder: str,
+    client: TestClient,
+    tmp_path: Path,
+    placeholder: str,
 ) -> None:
     (tmp_path / ".env").write_text(
         "\n".join(
@@ -84,7 +88,8 @@ def test_llm_settings_treat_documented_key_placeholders_as_unconfigured(
 
 
 def test_update_llm_settings_persists_project_env(
-    client: TestClient, tmp_path: Path,
+    client: TestClient,
+    tmp_path: Path,
 ) -> None:
     response = client.put(
         "/settings/llm",
@@ -116,7 +121,8 @@ def test_update_llm_settings_persists_project_env(
 
 
 def test_update_deepseek_settings_uses_exact_reported_payload(
-    client: TestClient, tmp_path: Path,
+    client: TestClient,
+    tmp_path: Path,
 ) -> None:
     response = client.put(
         "/settings/llm",
@@ -140,7 +146,8 @@ def test_update_deepseek_settings_uses_exact_reported_payload(
 
 
 def test_settings_write_migrates_legacy_env_to_canonical_path(
-    client: TestClient, tmp_path: Path,
+    client: TestClient,
+    tmp_path: Path,
 ) -> None:
     legacy_path = tmp_path / "legacy" / ".env"
     legacy_path.parent.mkdir()
@@ -167,7 +174,8 @@ def test_settings_write_migrates_legacy_env_to_canonical_path(
 
 
 def test_settings_write_permission_error_is_actionable(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         api_server,
@@ -187,13 +195,13 @@ def test_settings_write_permission_error_is_actionable(
 
     assert response.status_code == 503
     assert response.json()["detail"] == (
-        "Unable to save settings; check ownership and permissions for "
-        "~/.vibe-trading/.env"
+        "Unable to save settings; check ownership and permissions for ~/.vibe-trading/.env"
     )
 
 
 def test_update_nvidia_settings_persists_provider_namespace(
-    client: TestClient, tmp_path: Path,
+    client: TestClient,
+    tmp_path: Path,
 ) -> None:
     response = client.put(
         "/settings/llm",
@@ -213,7 +221,8 @@ def test_update_nvidia_settings_persists_provider_namespace(
 
 
 def test_get_data_source_settings_treats_placeholder_as_unconfigured(
-    client: TestClient, tmp_path: Path,
+    client: TestClient,
+    tmp_path: Path,
 ) -> None:
     response = client.get("/settings/data-sources")
 
@@ -229,7 +238,8 @@ def test_get_data_source_settings_treats_placeholder_as_unconfigured(
 
 
 def test_settings_response_never_exposes_configured_secret_hints(
-    client: TestClient, tmp_path: Path,
+    client: TestClient,
+    tmp_path: Path,
 ) -> None:
     (tmp_path / ".env").write_text(
         "\n".join(
@@ -261,7 +271,8 @@ def test_settings_response_never_exposes_configured_secret_hints(
 
 
 def test_settings_reads_reject_remote_dev_mode_clients(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     env_path = tmp_path / ".env"
     env_example = tmp_path / ".env.example"
@@ -292,7 +303,8 @@ def test_settings_reads_reject_remote_dev_mode_clients(
 
 
 def test_settings_reads_allow_loopback_without_bearer_even_when_api_auth_key_configured(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     env_path = tmp_path / ".env"
     env_example = tmp_path / ".env.example"
@@ -327,7 +339,8 @@ def test_settings_reads_allow_loopback_without_bearer_even_when_api_auth_key_con
 
 
 def test_update_data_source_settings_persists_tushare_token(
-    client: TestClient, tmp_path: Path,
+    client: TestClient,
+    tmp_path: Path,
 ) -> None:
     response = client.put(
         "/settings/data-sources",
@@ -346,7 +359,8 @@ def test_update_data_source_settings_persists_tushare_token(
 
 
 def test_settings_writes_reject_remote_dev_mode_clients(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     env_example = tmp_path / ".env.example"
     env_path = tmp_path / ".env"
@@ -365,8 +379,13 @@ def test_settings_writes_reject_remote_dev_mode_clients(
     assert not env_path.exists()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows does not expose POSIX owner-only mode bits through st_mode",
+)
 def test_update_settings_writes_env_file_with_0600_mode(
-    client: TestClient, tmp_path: Path,
+    client: TestClient,
+    tmp_path: Path,
 ) -> None:
     """A Web-UI settings write must leave agent/.env owner-read/write only."""
     response = client.put(
@@ -380,7 +399,8 @@ def test_update_settings_writes_env_file_with_0600_mode(
 
 
 def test_atomic_write_secret_is_crash_safe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A crash during the replace must not corrupt or truncate the secret file,
     nor leave a stray temp file holding the secret behind."""
@@ -403,6 +423,10 @@ def test_atomic_write_secret_is_crash_safe(
     assert list(tmp_path.glob(".env.*")) == []
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows does not expose POSIX owner-only mode bits through st_mode",
+)
 def test_atomic_write_secret_creates_0600_file(tmp_path: Path) -> None:
     """Fresh secret files are created owner-only via the atomic path."""
     from src.api import helpers

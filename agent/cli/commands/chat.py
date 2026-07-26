@@ -45,9 +45,15 @@ def cmd_model(ctx: Any = None, *args: str) -> int:  # noqa: ARG001 — ctx unuse
     """Print the current provider/model + how to re-run the wizard."""
     console = _resolve_console()
     try:
-        from cli._legacy import _show_settings
+        from src.providers.llm import provider_diagnostics
 
-        _show_settings()
+        diagnostic = provider_diagnostics()
+        provider = diagnostic.get("provider") or "(not set)"
+        model = diagnostic.get("model") or "(not set)"
+        base_url = diagnostic.get("base_url") or "(not set)"
+        console.print(Text(f"Provider: {provider}", style="bold"))
+        console.print(Text(f"Model:    {model}", style="bold"))
+        console.print(Text(f"Base URL: {base_url}", style="bold"))
     except Exception as exc:  # noqa: BLE001 — legacy may be absent on partial install
         from src.config.accessor import get_env_config
 
@@ -56,7 +62,7 @@ def cmd_model(ctx: Any = None, *args: str) -> int:  # noqa: ARG001 — ctx unuse
         model = cfg.llm.langchain_model_name or "(not set)"
         console.print(Text(f"Provider: {provider}", style="bold"))
         console.print(Text(f"Model:    {model}", style="bold"))
-        console.print(Text(f"(legacy _show_settings unavailable: {exc})", style="dim"))
+        console.print(Text(f"(provider diagnostic unavailable: {exc})", style="dim"))
 
     console.print()
     console.print(
@@ -129,7 +135,7 @@ def cmd_journal(ctx: Any = None, *args: str) -> int:
         body.append("Usage: ", style="dim")
         body.append("/journal <path-to-csv>\n", style="bold")
         body.append("Example: ", style="dim")
-        body.append('/journal ~/Downloads/journal.csv\n\n', style="bold")
+        body.append("/journal ~/Downloads/journal.csv\n\n", style="bold")
         body.append("Or type the prompt directly: ", style="dim")
         body.append('"analyze my trade journal at <path>"', style="bold")
         console.print(Panel(body, title="/journal", border_style="dim", padding=(1, 2)))
