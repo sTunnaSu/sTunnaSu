@@ -1,9 +1,9 @@
 """Statistical validation for backtest results.
 
 Three independent tools:
-  - Monte Carlo permutation test: is the strategy significantly better than random?
+  - Trade-order Monte Carlo: how sensitive is the realised path to trade order?
   - Bootstrap Sharpe CI: how stable is the risk-adjusted return?
-  - Walk-Forward analysis: is performance consistent across time windows?
+  - Rolling-window analysis: is realised performance consistent across windows?
 
 Usage: called automatically by BaseEngine.run_backtest when config[\"validation\"]
 is present, or invoked directly on backtest outputs.
@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
-import pandas as pd
+import pandas as pd  # type: ignore[import-untyped]
 
 from backtest.models import TradeRecord
+from backtest.metrics import trade_outcome_pnl
 
 
 # ─── Monte Carlo Permutation Test ───
@@ -34,8 +35,8 @@ def monte_carlo_test(
 ) -> Dict[str, Any]:
     """Shuffle trade PnL order to test path significance.
 
-    Null hypothesis: the observed Sharpe / max-drawdown is no better than
-    a random ordering of the same trades.
+    This is a path-sensitivity diagnostic, not a random-entry strategy null.
+    It permutes the same net-of-cost trade outcomes.
 
     Args:
         trades: Completed round-trip trades from backtest.
@@ -57,7 +58,7 @@ def monte_carlo_test(
     if len(trades) < 3:
         return {"error": "need at least 3 trades", "p_value_sharpe": 1.0}
 
-    pnls = np.array([t.pnl for t in trades])
+    pnls = np.array([trade_outcome_pnl(trade) for trade in trades])
     actual = _path_metrics(pnls, initial_capital)
 
     rng = np.random.default_rng(seed)
@@ -170,18 +171,20 @@ def _sharpe(returns: np.ndarray, bars_per_year: int = 252) -> float:
     return float(returns.mean() / (std + 1e-10) * np.sqrt(bars_per_year))
 
 
-# ─── Walk-Forward Analysis ───
+# ─── Rolling-window equity analysis ───
 
 
-def walk_forward_analysis(
+def rolling_window_analysis(
     equity_curve: pd.Series,
     trades: List[TradeRecord],
     n_windows: int = 5,
     bars_per_year: int = 252,
 ) -> Dict[str, Any]:
-    """Split backtest into sequential windows, check consistency.
+    """Split one completed backtest into sequential windows.
 
     Each window is evaluated independently (returns normalised to window start).
+    This function does not retrain, refit, freeze, or roll a strategy forward,
+    so its output is not walk-forward model validation.
 
     Args:
         equity_curve: Equity time series.
@@ -190,7 +193,7 @@ def walk_forward_analysis(
         bars_per_year: Annualisation factor.
 
     Returns:
-        Dict with per_window stats, consistency metrics.
+        Dict with per-window statistics and explicit methodology metadata.
     """
     if isinstance(n_windows, bool) or not isinstance(n_windows, Integral) or n_windows < 1:
         return {"error": f"n_windows must be >= 1, got {n_windows}"}
@@ -220,7 +223,7 @@ def walk_forward_analysis(
         dd = (win_eq - peak) / peak.replace(0, 1)
         max_dd = float(dd.min())
 
-        win_pnls = [t.pnl for t in win_trades]
+        win_pnls = [trade_outcome_pnl(trade) for trade in win_trades]
         win_rate = len([p for p in win_pnls if p > 0]) / len(win_pnls) if win_pnls else 0.0
 
         windows.append(
@@ -242,6 +245,8 @@ def walk_forward_analysis(
     profitable_windows = sum(1 for r in returns_list if r > 0)
 
     return {
+        "analysis_type": "rolling_window_equity",
+        "retraining_performed": False,
         "n_windows": n_windows,
         "windows": windows,
         "profitable_windows": profitable_windows,
@@ -251,6 +256,27 @@ def walk_forward_analysis(
         "sharpe_mean": round(float(np.mean(sharpes_list)), 4),
         "sharpe_std": round(float(np.std(sharpes_list)), 4),
     }
+
+
+def walk_forward_analysis(
+    equity_curve: pd.Series,
+    trades: List[TradeRecord],
+    n_windows: int = 5,
+    bars_per_year: int = 252,
+) -> Dict[str, Any]:
+    """Backward-compatible alias for :func:`rolling_window_analysis`.
+
+    The legacy function and configuration name are retained so historical
+    configs continue to run. The returned payload identifies the method as
+    rolling-window equity analysis and explicitly states that no retraining
+    occurred.
+    """
+    return rolling_window_analysis(
+        equity_curve,
+        trades,
+        n_windows=n_windows,
+        bars_per_year=bars_per_year,
+    )
 
 
 # ─── Runner integration ───
@@ -268,7 +294,8 @@ def run_validation(
     Reads from config["validation"]:
       - monte_carlo: {n_simulations, seed}
       - bootstrap: {n_bootstrap, confidence, seed}
-      - walk_forward: {n_windows}
+      - rolling_window: {n_windows}
+      - walk_forward: {n_windows} (deprecated compatibility key)
 
     Args:
         config: Backtest config (must contain "validation" key).
@@ -302,7 +329,15 @@ def run_validation(
             seed=bs_cfg.get("seed", 42),
         )
 
-    if "walk_forward" in v_cfg:
+    if "rolling_window" in v_cfg:
+        rw_cfg = v_cfg["rolling_window"] if isinstance(v_cfg["rolling_window"], dict) else {}
+        results["rolling_window"] = rolling_window_analysis(
+            equity_curve,
+            trades,
+            n_windows=rw_cfg.get("n_windows", 5),
+            bars_per_year=bars_per_year,
+        )
+    elif "walk_forward" in v_cfg:
         wf_cfg = v_cfg["walk_forward"] if isinstance(v_cfg["walk_forward"], dict) else {}
         results["walk_forward"] = walk_forward_analysis(
             equity_curve,
@@ -331,25 +366,53 @@ def _load_trades(run_dir: Path) -> List[TradeRecord]:
     if df.empty:
         return []
 
-    # trades.csv has entry+exit row pairs; extract exit rows (they have pnl != 0)
+    def optional_float(value: Any) -> float | None:
+        if value is None or pd.isna(value) or str(value).strip() == "":
+            return None
+        return float(value)
+
     trades = []
-    exit_rows = df[df["pnl"] != 0].reset_index(drop=True)
-    for _, row in exit_rows.iterrows():
+    has_cost_ledger = {"net_pnl", "gross_pnl", "commission", "slippage_cost"}.issubset(df.columns)
+    if has_cost_ledger:
+        if len(df) % 2:
+            raise ValueError("trades.csv must contain complete entry/exit row pairs")
+        row_pairs = [(df.iloc[index], df.iloc[index + 1]) for index in range(0, len(df), 2)]
+    else:
+        # Legacy artifacts did not preserve enough fields to identify a
+        # zero-gross, cost-only exit. Retain their historical non-zero-PnL
+        # fallback rather than inventing missing costs.
+        row_pairs = [(row, row) for _, row in df[df["pnl"] != 0].reset_index(drop=True).iterrows()]
+
+    for entry_row, exit_row in row_pairs:
+        pnl = float(exit_row.get("pnl", 0))
+        commission = float(exit_row.get("commission", 0) or 0)
+        slippage_cost = float(exit_row.get("slippage_cost", 0) or 0)
         trades.append(
             TradeRecord(
-                symbol=str(row.get("code", "")),
-                direction=1 if row.get("side") == "sell" else -1,
-                entry_price=0.0,
-                exit_price=float(row.get("price", 0)),
-                entry_time=pd.Timestamp(row.get("timestamp", "2000-01-01")),
-                exit_time=pd.Timestamp(row.get("timestamp", "2000-01-01")),
-                size=float(row.get("qty", 0)),
+                symbol=str(exit_row.get("code", "")),
+                direction=1 if entry_row.get("side") == "buy" else -1,
+                entry_price=float(entry_row.get("fill_price", entry_row.get("price", 0))),
+                exit_price=float(exit_row.get("fill_price", exit_row.get("price", 0))),
+                entry_time=pd.Timestamp(entry_row.get("timestamp", "2000-01-01")),
+                exit_time=pd.Timestamp(exit_row.get("timestamp", "2000-01-01")),
+                size=float(exit_row.get("qty", 0)),
                 leverage=1.0,
-                pnl=float(row.get("pnl", 0)),
-                pnl_pct=float(row.get("return_pct", 0)),
-                exit_reason=str(row.get("reason", "signal")),
-                holding_bars=int(row.get("holding_days", 0)),
-                commission=0.0,
+                pnl=pnl,
+                pnl_pct=float(exit_row.get("return_pct", 0)),
+                exit_reason=str(exit_row.get("reason", "signal")),
+                holding_bars=int(exit_row.get("holding_days", 0)),
+                commission=commission,
+                signal_time=(
+                    pd.Timestamp(exit_row["signal_time"])
+                    if "signal_time" in exit_row and pd.notna(exit_row["signal_time"])
+                    else None
+                ),
+                entry_decision_price=optional_float(entry_row.get("decision_price")),
+                exit_decision_price=optional_float(exit_row.get("decision_price")),
+                gross_pnl=optional_float(exit_row.get("gross_pnl")),
+                slippage_cost=slippage_cost,
+                net_pnl=optional_float(exit_row.get("net_pnl")),
+                holding_days=int(exit_row.get("holding_days", 0)),
             )
         )
     return trades
@@ -416,7 +479,7 @@ def write_validation_json(path: Path, results: Dict[str, Any]) -> Dict[str, Any]
 
 
 def main(run_dir: Path) -> Dict[str, Any]:
-    """Run all three validations on existing backtest artifacts.
+    """Run the default validation diagnostics on existing backtest artifacts.
 
     Reads equity.csv, trades.csv, and config.json from run_dir.
 
@@ -440,7 +503,7 @@ def main(run_dir: Path) -> Dict[str, Any]:
     results = {
         "monte_carlo": monte_carlo_test(trades, initial_capital),
         "bootstrap": bootstrap_sharpe_ci(equity),
-        "walk_forward": walk_forward_analysis(equity, trades),
+        "rolling_window": rolling_window_analysis(equity, trades),
     }
 
     out = run_dir / "artifacts" / "validation.json"

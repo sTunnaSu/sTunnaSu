@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -43,6 +44,10 @@ class FakeHttpClient:
         return self.responses.pop(0)
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows does not expose POSIX owner-only mode bits through st_mode",
+)
 def test_config_read_write_masks_key_and_uses_0600(qveris_config_path: Path):
     saved = qt.save_qveris_config(
         qt.QVerisConfig(
@@ -61,9 +66,7 @@ def test_config_read_write_masks_key_and_uses_0600(qveris_config_path: Path):
 
 
 def test_env_overrides_file_config(monkeypatch: pytest.MonkeyPatch):
-    qt.save_qveris_config(
-        qt.QVerisConfig(enabled=True, base_url="https://file.test", api_key="file-key")
-    )
+    qt.save_qveris_config(qt.QVerisConfig(enabled=True, base_url="https://file.test", api_key="file-key"))
     monkeypatch.setenv("QVERIS_API_KEY", "env-key")
     monkeypatch.setenv("QVERIS_BASE_URL", "https://env.test/api")
 
@@ -86,9 +89,7 @@ def test_free_mode_tools_are_hidden():
 
 
 def test_free_mode_execute_is_unavailable(monkeypatch: pytest.MonkeyPatch):
-    qt.save_qveris_config(
-        qt.QVerisConfig(enabled=True, api_key="sk-live", mode="free")
-    )
+    qt.save_qveris_config(qt.QVerisConfig(enabled=True, api_key="sk-live", mode="free"))
 
     class FakeClient:
         def inspect(self, tool_ids, **kwargs):
@@ -104,9 +105,7 @@ def test_free_mode_execute_is_unavailable(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(qt.QVerisExecuteTool, "_client", lambda self: FakeClient())
 
-    payload = json.loads(
-        qt.QVerisExecuteTool().execute(tool_id="tool_1", parameters={"x": 1})
-    )
+    payload = json.loads(qt.QVerisExecuteTool().execute(tool_id="tool_1", parameters={"x": 1}))
 
     assert payload == {"ok": False, "error": "QVeris is not configured"}
 

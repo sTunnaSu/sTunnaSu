@@ -38,6 +38,7 @@ def _trade(
     direction: int = 1,
     exit_reason: str = "signal",
     holding_bars: int = 5,
+    net_pnl: float | None = None,
 ) -> TradeRecord:
     return TradeRecord(
         symbol=symbol,
@@ -53,6 +54,7 @@ def _trade(
         exit_reason=exit_reason,
         holding_bars=holding_bars,
         commission=1.0,
+        net_pnl=net_pnl,
     )
 
 
@@ -149,6 +151,19 @@ class TestWinRateAndStats:
         trades = [_trade(holding_bars=5), _trade(holding_bars=10), _trade(holding_bars=15)]
         stats = win_rate_and_stats(trades)
         assert stats["avg_holding_bars"] == 10.0
+
+    def test_net_pnl_controls_outcome_when_available(self) -> None:
+        trades = [
+            _trade(pnl=1.0, net_pnl=-1.0),
+            _trade(pnl=2.0, net_pnl=1.0),
+        ]
+
+        stats = win_rate_and_stats(trades)
+
+        assert stats["win_rate"] == pytest.approx(0.5)
+        assert stats["profit_factor"] == pytest.approx(1.0)
+        assert stats["expectancy_per_trade"] == pytest.approx(0.0)
+        assert stats["max_consecutive_loss"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -276,8 +291,7 @@ class TestCalcMetrics:
         eq = pd.Series([1_000_000.0], index=pd.bdate_range("2025-01-01", periods=1))
         bench_ret = pd.Series([0.0], index=eq.index)
         m = calc_metrics(eq, [], 1_000_000, 252, bench_ret=bench_ret)
-        for key in ("sharpe", "sortino", "information_ratio",
-                    "annual_return", "max_drawdown", "calmar"):
+        for key in ("sharpe", "sortino", "information_ratio", "annual_return", "max_drawdown", "calmar"):
             assert math.isfinite(m[key]), f"{key} is not finite: {m[key]!r}"
         assert m["sharpe"] == 0.0
         assert m["information_ratio"] == 0.0
@@ -295,10 +309,12 @@ class TestCalcMetrics:
     def test_calmar_positive_for_drawdown(self) -> None:
         """Growing equity with a dip should have positive Calmar."""
         dates = pd.bdate_range("2025-01-01", periods=100)
-        values = np.concatenate([
-            np.linspace(1_000_000, 900_000, 30),  # dip
-            np.linspace(900_000, 1_200_000, 70),   # recovery
-        ])
+        values = np.concatenate(
+            [
+                np.linspace(1_000_000, 900_000, 30),  # dip
+                np.linspace(900_000, 1_200_000, 70),  # recovery
+            ]
+        )
         eq = pd.Series(values, index=dates)
         m = calc_metrics(eq, [], 1_000_000, 252)
         assert m["max_drawdown"] < 0
@@ -372,9 +388,7 @@ class TestTurnoverMetrics:
 
     def _positions(self) -> pd.DataFrame:
         dates = pd.bdate_range("2025-01-01", periods=4)
-        return pd.DataFrame(
-            {"A": [1.0, 0.0, 1.0, 0.0], "B": [0.0, 1.0, 0.0, 1.0]}, index=dates
-        )
+        return pd.DataFrame({"A": [1.0, 0.0, 1.0, 0.0], "B": [0.0, 1.0, 0.0, 1.0]}, index=dates)
 
     def test_turnover_keys_present(self) -> None:
         m = calc_metrics(self._equity(), [], 1_000_000, 252, positions=self._positions())
@@ -419,12 +433,32 @@ class TestExecutionMetrics:
         )
         fills = [
             FillRecord(
-                dates[0], "LONG", "buy", "entry", 1, 1.0,
-                10.0, 10.5, 10.5, 1.0, 0.5, "signal",
+                dates[0],
+                "LONG",
+                "buy",
+                "entry",
+                1,
+                1.0,
+                10.0,
+                10.5,
+                10.5,
+                1.0,
+                0.5,
+                "signal",
             ),
             FillRecord(
-                dates[1], "LONG", "sell", "exit", 1, 1.0,
-                11.0, 10.5, 10.5, 2.0, 0.5, "signal",
+                dates[1],
+                "LONG",
+                "sell",
+                "exit",
+                1,
+                1.0,
+                11.0,
+                10.5,
+                10.5,
+                2.0,
+                0.5,
+                "signal",
             ),
         ]
 
@@ -447,7 +481,5 @@ class TestExecutionMetrics:
         assert metrics["mean_active_positions"] == pytest.approx(1.5)
 
     def test_empty_execution_inputs_are_zero_safe(self) -> None:
-        metrics = calc_execution_metrics(
-            pd.DataFrame(), [], observation_count=0, bars_per_year=None
-        )
+        metrics = calc_execution_metrics(pd.DataFrame(), [], observation_count=0, bars_per_year=None)
         assert all(value == pytest.approx(0.0) for value in metrics.values())

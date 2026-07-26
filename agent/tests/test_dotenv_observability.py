@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import getpass
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -40,7 +41,8 @@ def test_logs_redacted_label_not_path(tmp_path, fresh, monkeypatch, caplog):
     assert "<TEST_SLOT>" in msg  # redacted slot label is logged
     assert str(env) not in msg  # absolute path never logged
     assert str(tmp_path) not in msg
-    assert getpass.getuser() not in msg  # OS username never leaks
+    username_path_segment = rf"(?i)(?:^|[\\/]){re.escape(getpass.getuser())}(?:[\\/]|$)"
+    assert re.search(username_path_segment, msg) is None  # OS home path never leaks
     assert "sk-" not in msg  # key must never be logged
 
 

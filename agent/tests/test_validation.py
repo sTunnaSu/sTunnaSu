@@ -3,13 +3,14 @@
 Validates:
   - Monte Carlo permutation test: p-value, output structure
   - Bootstrap Sharpe CI: confidence interval bounds, prob_positive
-  - Walk-Forward analysis: window splitting, consistency metrics
+  - Rolling-window analysis: window splitting, consistency metrics
   - run_validation dispatcher
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,7 @@ from backtest.models import TradeRecord
 from backtest.validation import (
     bootstrap_sharpe_ci,
     monte_carlo_test,
+    rolling_window_analysis,
     run_validation,
     walk_forward_analysis,
     write_validation_json,
@@ -38,21 +40,23 @@ def _make_trades(pnls: list[float], start: str = "2025-01-01") -> list[TradeReco
     for i, pnl in enumerate(pnls):
         entry = base + pd.Timedelta(days=i * 2)
         exit_ = entry + pd.Timedelta(days=1)
-        trades.append(TradeRecord(
-            symbol="TEST",
-            direction=1,
-            entry_price=100.0,
-            exit_price=100.0 + pnl / 10,
-            entry_time=entry,
-            exit_time=exit_,
-            size=10.0,
-            leverage=1.0,
-            pnl=pnl,
-            pnl_pct=pnl / 1000 * 100,
-            exit_reason="signal",
-            holding_bars=1,
-            commission=0.0,
-        ))
+        trades.append(
+            TradeRecord(
+                symbol="TEST",
+                direction=1,
+                entry_price=100.0,
+                exit_price=100.0 + pnl / 10,
+                entry_time=entry,
+                exit_time=exit_,
+                size=10.0,
+                leverage=1.0,
+                pnl=pnl,
+                pnl_pct=pnl / 1000 * 100,
+                exit_reason="signal",
+                holding_bars=1,
+                commission=0.0,
+            )
+        )
     return trades
 
 
@@ -120,6 +124,14 @@ class TestMonteCarlo:
         r1 = monte_carlo_test(trades, 1_000_000, n_simulations=100, seed=42)
         r2 = monte_carlo_test(trades, 1_000_000, n_simulations=100, seed=42)
         assert r1["p_value_sharpe"] == r2["p_value_sharpe"]
+
+    def test_uses_net_pnl_when_available(self) -> None:
+        trades = _make_trades([10, 10, 10])
+        trades = [replace(trade, net_pnl=net_pnl) for trade, net_pnl in zip(trades, [-10.0, -20.0, -30.0])]
+
+        result = monte_carlo_test(trades, 1_000_000, n_simulations=10)
+
+        assert result["actual_sharpe"] < 0
 
 
 # ---------------------------------------------------------------------------
@@ -198,11 +210,13 @@ class TestBootstrapSharpe:
 # ---------------------------------------------------------------------------
 
 
-class TestWalkForward:
+class TestRollingWindow:
     def test_output_structure(self) -> None:
         eq = _make_equity(100)
         trades = _make_trades([100, -50] * 10)
-        result = walk_forward_analysis(eq, trades, n_windows=4)
+        result = rolling_window_analysis(eq, trades, n_windows=4)
+        assert result["analysis_type"] == "rolling_window_equity"
+        assert result["retraining_performed"] is False
         assert result["n_windows"] == 4
         assert len(result["windows"]) == 4
         assert "consistency_rate" in result
@@ -212,7 +226,7 @@ class TestWalkForward:
     def test_window_fields(self) -> None:
         eq = _make_equity(100)
         trades = _make_trades([100, -50] * 10)
-        result = walk_forward_analysis(eq, trades, n_windows=5)
+        result = rolling_window_analysis(eq, trades, n_windows=5)
         w = result["windows"][0]
         assert "window" in w
         assert "start" in w
@@ -227,13 +241,13 @@ class TestWalkForward:
         """Equity with positive drift should have high consistency."""
         eq = _make_equity(200, drift=0.003)
         trades = _make_trades([100] * 50)
-        result = walk_forward_analysis(eq, trades, n_windows=5)
+        result = rolling_window_analysis(eq, trades, n_windows=5)
         assert result["consistency_rate"] > 0.5
 
     def test_windows_cover_full_range(self) -> None:
         eq = _make_equity(100)
         trades = _make_trades([100] * 10)
-        result = walk_forward_analysis(eq, trades, n_windows=5)
+        result = rolling_window_analysis(eq, trades, n_windows=5)
         first_start = result["windows"][0]["start"]
         last_end = result["windows"][-1]["end"]
         assert first_start == str(eq.index[0].date())
@@ -241,7 +255,7 @@ class TestWalkForward:
 
     def test_too_few_bars(self) -> None:
         eq = pd.Series([100, 101], index=pd.bdate_range("2025-01-01", periods=2))
-        result = walk_forward_analysis(eq, [], n_windows=5)
+        result = rolling_window_analysis(eq, [], n_windows=5)
         assert "error" in result
 
     @pytest.mark.parametrize("n_windows", [0, -1, -3, 1.5, "5", True])
@@ -253,7 +267,7 @@ class TestWalkForward:
         ``consistency_rate``.
         """
         eq = _make_equity(100)
-        result = walk_forward_analysis(eq, [], n_windows=n_windows)
+        result = rolling_window_analysis(eq, [], n_windows=n_windows)
         assert "error" in result
 
 
@@ -301,9 +315,7 @@ class TestRunValidation:
             ("walk_forward", "n_windows", "5"),
         ],
     )
-    def test_malformed_nested_config_returns_error(
-        self, section: str, field: str, value: object
-    ) -> None:
+    def test_malformed_nested_config_returns_error(self, section: str, field: str, value: object) -> None:
         """Raw nested config values fail visibly instead of raising."""
         result = run_validation(
             {"validation": {section: {field: value}}},
@@ -357,9 +369,7 @@ class TestWriteValidationJson:
         assert out.is_file()
         assert _strict_json_load(out.read_text(encoding="utf-8")) == {"ok": 1.0}
 
-    def test_numpy_scalars_from_public_validators_are_strict_json(
-        self, tmp_path: Path
-    ) -> None:
+    def test_numpy_scalars_from_public_validators_are_strict_json(self, tmp_path: Path) -> None:
         results = {
             "monte_carlo": monte_carlo_test(
                 _make_trades([100, -50, 200]),

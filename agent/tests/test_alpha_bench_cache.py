@@ -9,6 +9,7 @@ sidecar, so the tampered blob is rejected before ``pickle.loads``.
 from __future__ import annotations
 
 import hashlib
+import os
 import pickle
 import stat
 
@@ -56,13 +57,15 @@ def test_tampered_pickle_with_unkeyed_sha256_is_rejected(tmp_path, no_api_key):
     # payload and recomputes only a *bare* sha256 sidecar (the pre-VT-010 tag).
     evil = pickle.dumps({"close": pd.DataFrame({"X": [9.0]}), "pwned": True})
     cache_path.write_bytes(evil)
-    abt._sha256_path(cache_path).write_text(
-        hashlib.sha256(evil).hexdigest(), encoding="utf-8"
-    )
+    abt._sha256_path(cache_path).write_text(hashlib.sha256(evil).hexdigest(), encoding="utf-8")
 
     assert abt._read_pickle_cache(cache_path) is None
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows does not expose POSIX owner-only mode bits through st_mode",
+)
 def test_fallback_key_is_stable_and_0600(tmp_path, no_api_key):
     key1 = abt._cache_hmac_key(tmp_path)
     key2 = abt._cache_hmac_key(tmp_path)
