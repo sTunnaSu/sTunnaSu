@@ -67,7 +67,8 @@ immutable, offline, and contains only date, OHLC, and volume fields. The
 acceptance run uses explicit starting capital, one-basis-point commission,
 five-basis-point slippage, limit orders, bar latency, expiry, persistence, and
 volume participation. It also runs seeded Monte Carlo/bootstrap validation and
-fixed walk-forward windows.
+fixed sequential equity-curve windows. These windows are a consistency
+diagnostic only; they do not retrain or roll a model forward.
 
 Acceptance requires:
 

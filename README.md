@@ -287,6 +287,36 @@ vibe-trading run -p "Analyze my trading behavior, extract my shadow strategy, an
 
 ## 🧪 Research Workflow
 
+### Experimental AgentLarry Phase 8 latency runtime
+
+This working tree includes an experimental paper-only Phase 8 composition under
+`agent/src/phase8_runtime/`. It joins the latency/decay research gate to a
+bounded Alpaca paper adapter, append-only runtime records, risk limits,
+reconciliation, and evidence-qualified reports.
+
+Important boundaries:
+
+- the sanitized example is research-only and paper execution is disabled;
+- import, CLI help, tool discovery, and deterministic tests require no broker
+  connection or credentials;
+- actually running the research-only runtime performs read-only Alpaca paper
+  preflight calls;
+- dry-run and paper stages require separate, content-addressed release evidence;
+- no strategy has been accepted and no prospective untouched out-of-sample
+  advantage has been demonstrated;
+- mocked tests do not prove real Alpaca behavior; and
+- the current Phase 8 release status is `NO_GO`.
+
+Inspect the offline command surface with:
+
+```powershell
+python -m src.phase8_runtime --help
+```
+
+The architecture, limitations, and current release evidence are documented in
+`agent/src/phase8_runtime/README.md` and
+`agent/PHASE8_INDEPENDENT_AUDIT.md`.
+
 Most runs follow the same evidence path: route the request, load the right market context, execute tools, validate outputs, and keep the artifacts inspectable.
 
 | Layer | What happens |
@@ -294,7 +324,7 @@ Most runs follow the same evidence path: route the request, load the right marke
 | **Plan** | Selects the relevant finance skills, tools, data sources, and swarm preset when useful. |
 | **Ground** | Pulls A-shares, HK/US equities, crypto, futures, forex, documents, or web context through the available loaders. |
 | **Execute** | Generates testable strategy code, runs tools, and uses the matching backtest engine or analysis workflow. |
-| **Validate** | Adds metrics, benchmark comparison, Monte Carlo, Bootstrap, Walk-Forward, run cards, and warnings where applicable. |
+| **Validate** | Adds metrics, benchmark comparison, trade-path Monte Carlo, Bootstrap, rolling-window consistency, run cards, and warnings where applicable. |
 | **Deliver** | Returns reports, artifacts, tool traces, and exports for TradingView, TDX, MetaTrader 5, MCP clients, or later sessions. |
 
 ---
@@ -527,7 +557,7 @@ vibe-trading-mcp               # start MCP server (stdio)
 - An **LLM API key** from any supported provider — or run locally with **Ollama** (no key needed)
 - **Python 3.11+** for Path B
 - **Docker** for Path A
-- OpenAI Codex can also be used with ChatGPT OAuth: set `LANGCHAIN_PROVIDER=openai-codex`, then run `vibe-trading provider login openai-codex`. This does not use `OPENAI_API_KEY`.
+- OpenAI Codex can also be used with ChatGPT OAuth: set `LANGCHAIN_PROVIDER=openai-codex`, then run `vibe-trading provider login openai-codex`. This does not use `OPENAI_API_KEY`. Larry stores its canonical token outside Git at `~/.vibe-trading/auth/openai-codex.json`; `vibe-trading provider logout openai-codex` removes only Codex OAuth credentials.
 
 > **Supported LLM providers:** OpenRouter, Requesty, OpenAI, DeepSeek, Gemini, Groq, DashScope/Qwen, Zhipu, Moonshot/Kimi, MiniMax, Xiaomi MIMO, Z.ai, Ollama (local). See `.env.example` for config.
 
@@ -625,7 +655,7 @@ Copy `agent/.env.example` to `agent/.env` and uncomment the provider block you w
 | `VIBE_TRADING_ALLOWED_RUN_ROOTS` | No | Extra comma-separated roots for generated-code run directories |
 | `CONTENT_FILTER_WARNING_THRESHOLD` | No | Content-filter warning ratio threshold (default 0.05 = 5%). When the ratio of LLM responses blocked by content moderation exceeds this, the run card warns you to switch providers. |
 
-<sub>* Ollama does not require an API key. OpenAI Codex uses ChatGPT OAuth and stores tokens via `oauth-cli-kit`, not in `agent/.env`.</sub>
+<sub>* Ollama does not require an API key. OpenAI Codex uses ChatGPT OAuth and stores its canonical token at `~/.vibe-trading/auth/openai-codex.json`, not in `agent/.env`.</sub>
 
 **Free data (no key needed):** A-shares via AKShare, HK/US equities via yfinance, crypto via OKX, 100+ crypto exchanges via CCXT. The system automatically selects the best available source for each market.
 
@@ -654,6 +684,7 @@ vibe-trading serve         # API server
 vibe-trading alpha list    # browse 461 pre-built alphas; show / bench / compare / export-manifest sub-commands available
 vibe-trading channels status --local  # inspect IM channel config and install hints
 vibe-trading provider doctor  # print redacted provider/proxy/package diagnostics
+vibe-trading provider logout openai-codex  # remove only Codex OAuth credentials
 ```
 
 <details>

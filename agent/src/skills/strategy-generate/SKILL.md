@@ -146,12 +146,13 @@ Self-check after writing `signal_engine.py`:
   "validation": {
     "monte_carlo": {"n_simulations": 1000},
     "bootstrap": {"n_bootstrap": 1000, "confidence": 0.95},
-    "walk_forward": {"n_windows": 5}
+    "rolling_window": {"n_windows": 5}
   }
   ```
-  - `monte_carlo`: permutation test — shuffles trade order to compute p-value (is Sharpe significantly better than random?)
+  - `monte_carlo`: trade-path diagnostic — shuffles the same net-of-cost trade outcomes; it is not a random-entry strategy test
   - `bootstrap`: resamples daily returns to compute Sharpe 95% confidence interval
-  - `walk_forward`: splits equity curve into N windows, checks performance consistency
+  - `rolling_window`: splits one completed equity curve into N windows and checks consistency; it does not retrain a model or create prospective out-of-sample evidence
+  - The legacy `walk_forward` key remains accepted for compatibility but performs the same rolling-window analysis
   - Each key is optional — include only the validations you want
   - Can also run standalone on past results: `python -m backtest.validation <run_dir>`
 

@@ -82,6 +82,11 @@ agent/tests/test_e2e_*.py
 # Local working notes
 NOTES.md
 
+# AgentLarry local research references and generated validation output
+/AgentLarry_Phase_8_Latency_Budgeter_Assignment.pdf
+/full_pytest_phases_rebased.log
+/agent/PHASE8_FINAL_REPORT.md
+
 # Agent tool aliases (auto-generated mirror of CLAUDE.md)
 AGENTS.md
 
