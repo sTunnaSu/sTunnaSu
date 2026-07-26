@@ -116,14 +116,11 @@ class SQLiteLatencyHistoryStore:
             elif int(row["schema_version"]) == 1:
                 columns = {
                     str(column["name"])
-                    for column in self._connection.execute(
-                        "PRAGMA table_info(phase8_latency_samples)"
-                    ).fetchall()
+                    for column in self._connection.execute("PRAGMA table_info(phase8_latency_samples)").fetchall()
                 }
                 if "order_id" not in columns:
                     self._connection.execute(
-                        "ALTER TABLE phase8_latency_samples "
-                        "ADD COLUMN order_id TEXT NOT NULL DEFAULT ''"
+                        "ALTER TABLE phase8_latency_samples ADD COLUMN order_id TEXT NOT NULL DEFAULT ''"
                     )
                 self._connection.execute(
                     "UPDATE phase8_schema_versions SET schema_version = ? WHERE schema_name = ?",
@@ -163,11 +160,29 @@ class SQLiteLatencyHistoryStore:
         """Append atomically, retaining exact Decimal text and availability."""
         with self._lock, self._write_transaction():
             prior = self._connection.execute(
-                "SELECT semantic_fingerprint FROM phase8_latency_samples WHERE sample_id = ?",
+                "SELECT * FROM phase8_latency_samples WHERE sample_id = ?",
                 (sample.sample_id,),
             ).fetchone()
             if prior is not None:
-                if prior["semantic_fingerprint"] != sample.semantic_fingerprint:
+                # ``recorded_at`` was historically set from the reconciliation
+                # clock, so the same source event could replay a few
+                # milliseconds later with an otherwise identical sample. The
+                # immutable row remains canonical; accept that legacy replay
+                # only when every source-derived field is unchanged.
+                same_source_sample = (
+                    prior["decision_id"] == sample.decision_id
+                    and prior["order_id"] == sample.order_id
+                    and prior["component"] == sample.component.value
+                    and prior["value_ms"] == sample.value_ms.canonical()
+                    and prior["component_available_at"] == utc_iso(sample.component_available_at)
+                    and prior["component_definition_version"] == sample.component_definition_version
+                    and prior["estimator_schema_version"] == sample.estimator_schema_version
+                    and bool(prior["valid"]) is sample.valid
+                    and prior["invalid_reason"] == sample.invalid_reason
+                    and prior["source_event_id"] == sample.source_event_id
+                    and prior["unit"] == sample.unit
+                )
+                if not same_source_sample:
                     raise HistoryConflictError(f"sample_id {sample.sample_id!r} has different content")
                 return False
             self._connection.execute(

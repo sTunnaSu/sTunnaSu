@@ -59,21 +59,23 @@ def test_alpaca_symbol_normalization(raw: str, canonical: str, is_crypto: bool) 
 def test_crypto_assets_are_discoverable_with_precision(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _enable_tap(
         monkeypatch,
-        [{
-            "id": "btc-id",
-            "symbol": "BTC/USD",
-            "name": "Bitcoin / US Dollar",
-            "status": "active",
-            "class": "crypto",
-            "exchange": "CRYPTO",
-            "tradable": True,
-            "fractionable": True,
-            "min_order_size": "0.00001",
-            "min_trade_increment": "0.000000001",
-            "price_increment": "0.01",
-            "marginable": False,
-            "shortable": False,
-        }],
+        [
+            {
+                "id": "btc-id",
+                "symbol": "BTC/USD",
+                "name": "Bitcoin / US Dollar",
+                "status": "active",
+                "class": "crypto",
+                "exchange": "CRYPTO",
+                "tradable": True,
+                "fractionable": True,
+                "min_order_size": "0.00001",
+                "min_trade_increment": "0.000000001",
+                "price_increment": "0.01",
+                "marginable": False,
+                "shortable": False,
+            }
+        ],
     )
 
     result = al.get_assets(_paper_cfg(), symbol="BTCUSD", quote_currency="USD")
@@ -106,6 +108,25 @@ def test_crypto_quote_uses_crypto_endpoint_and_alias(monkeypatch: pytest.MonkeyP
     assert result["quote"]["bid"] == 65000.0
     assert result["quote"]["ask"] == 65010.0
     assert result["quote"]["time"] == "2026-07-15T06:00:00Z"
+
+
+def test_alpaca_clock_snapshot_uses_paper_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _enable_tap(
+        monkeypatch,
+        {
+            "timestamp": "2026-07-22T18:00:00Z",
+            "is_open": True,
+            "next_open": "2026-07-23T13:30:00Z",
+            "next_close": "2026-07-22T20:00:00Z",
+        },
+    )
+
+    result = al.get_clock_snapshot(_paper_cfg())
+
+    assert calls == [("https://paper-api.alpaca.markets/v2/clock", "GET", None)]
+    assert result["status"] == "ok"
+    assert result["is_paper"] is True
+    assert result["timestamp"] == "2026-07-22T18:00:00Z"
 
 
 def test_crypto_history_uses_crypto_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -182,6 +203,7 @@ def test_crypto_paper_order_normalizes_symbol_and_schema(monkeypatch: pytest.Mon
         notional=5,
         order_type="market",
         time_in_force="gtc",
+        client_order_id="dec_0123456789abcdef0123456789abcdef",
     )
 
     submitted = json.loads(calls[0][2] or "{}")
@@ -189,10 +211,12 @@ def test_crypto_paper_order_normalizes_symbol_and_schema(monkeypatch: pytest.Mon
     assert submitted["symbol"] == "BTC/USD"
     assert submitted["notional"] == "5.0"
     assert submitted["time_in_force"] == "gtc"
+    assert submitted["client_order_id"] == "dec_0123456789abcdef0123456789abcdef"
     assert result["status"] == "ok"
     assert result["is_paper"] is True
     assert result["asset_class"] == "crypto"
     assert result["order_id"] == "paper-crypto-order"
+    assert result["client_order_id"] == "dec_0123456789abcdef0123456789abcdef"
 
 
 def test_alpaca_profiles_and_agent_registry_expose_asset_discovery() -> None:
@@ -230,8 +254,7 @@ def test_compact_crypto_snapshot_combines_preflight_and_bar_statistics(
         return {
             "status": "ok",
             "bars": [
-                {"close": base + index, "high": base + index + 0.5, "low": base + index - 0.5}
-                for index in range(6)
+                {"close": base + index, "high": base + index + 0.5, "low": base + index - 0.5} for index in range(6)
             ],
         }
 
@@ -259,15 +282,17 @@ def test_compact_paper_preflight_keeps_all_order_prerequisites(monkeypatch: pyte
         "src.tools.trading_connector_tool.get_assets",
         lambda *_args, **_kwargs: {
             "status": "ok",
-            "assets": [{
-                "symbol": "BTC/USD",
-                "tradable": True,
-                "fractionable": True,
-                "min_order_size": 0.00001,
-                "min_trade_increment": 0.000000001,
-                "price_increment": 0.01,
-                "paper_eligible": True,
-            }],
+            "assets": [
+                {
+                    "symbol": "BTC/USD",
+                    "tradable": True,
+                    "fractionable": True,
+                    "min_order_size": 0.00001,
+                    "min_trade_increment": 0.000000001,
+                    "price_increment": 0.01,
+                    "paper_eligible": True,
+                }
+            ],
         },
     )
     monkeypatch.setattr(

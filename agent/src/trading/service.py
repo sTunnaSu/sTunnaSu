@@ -75,6 +75,18 @@ def get_account(profile_id: str | None = None, **overrides: Any) -> dict[str, An
     return _call_remote(profile, "account", {})
 
 
+def get_broker_clock(profile_id: str | None = None, **overrides: Any) -> dict[str, Any]:
+    """Read a connector's authenticated server clock when it exposes one."""
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "clock.read")
+    module = _sdk_module(profile.connector)
+    getter = getattr(module, "get_clock_snapshot", None)
+    if getter is None:
+        return _unsupported(profile, "clock.read")
+    return _with_profile(profile, getter(module.build_config(profile.config, overrides)))
+
+
 def get_assets(
     profile_id: str | None = None,
     *,
@@ -287,6 +299,7 @@ def place_order(
     order_type: str = "market",
     limit_price: float | None = None,
     time_in_force: str = "day",
+    client_order_id: str | None = None,
     session_id: str = "",
     **overrides: Any,
 ) -> dict[str, Any]:
@@ -315,6 +328,8 @@ def place_order(
         "limit_price": limit_price,
         "time_in_force": time_in_force,
     }
+    if client_order_id is not None:
+        place_kwargs["client_order_id"] = client_order_id
 
     if profile.environment == "paper":
         return _with_profile(profile, module.place_order(config, **place_kwargs))

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
 
+from src.latency_budgeter.domain.errors import HistoryConflictError
 from src.latency_budgeter.domain.history import (
     HistoryQuery,
     LatencyComponent,
@@ -163,3 +165,16 @@ def test_sqlite_history_schema_can_share_event_database(tmp_path) -> None:
     assert history.prior_window(query()).samples[0].value_ms == Milliseconds(9)
     history.close()
     event_ledger.close()
+
+
+def test_sqlite_replay_accepts_legacy_recorded_at_drift_only(tmp_path) -> None:
+    store = SQLiteLatencyHistoryStore(tmp_path / "history.db")
+    original = sample("stable-source-sample", value=9)
+    assert store.add(original) is True
+
+    replay = replace(original, recorded_at=original.recorded_at + timedelta(milliseconds=1))
+    assert store.add(replay) is False
+
+    with pytest.raises(HistoryConflictError):
+        store.add(replace(replay, value_ms=Milliseconds(10)))
+    store.close()

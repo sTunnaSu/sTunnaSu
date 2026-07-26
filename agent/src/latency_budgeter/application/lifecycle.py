@@ -174,9 +174,7 @@ class ExecutionLifecycleService:
                 "venue_reference": observation.venue_reference,
                 "side": authorization.side.value,
                 "symbol": authorization.symbol,
-                "component_validation": self._validation_payload(
-                    LatencyComponent.SUBMISSION, status, value, reason
-                ),
+                "component_validation": self._validation_payload(LatencyComponent.SUBMISSION, status, value, reason),
             },
             source_metadata={
                 "timestamp_source": observation.timestamp_source,
@@ -294,9 +292,7 @@ class ExecutionLifecycleService:
                 "actual_impact_proxy": decimal_text(observation.impact_cost),
                 "implementation_shortfall": decimal_text(implementation_shortfall),
                 "implementation_shortfall_source": shortfall_source,
-                "component_validation": self._validation_payload(
-                    LatencyComponent.FILL, status, value, reason
-                ),
+                "component_validation": self._validation_payload(LatencyComponent.FILL, status, value, reason),
             },
             source_metadata={
                 "timestamp_source": observation.timestamp_source,
@@ -360,7 +356,9 @@ class ExecutionLifecycleService:
             causation_id=(
                 projection.final_fill.event.event_id
                 if projection.final_fill
-                else projection.submission.event_id if projection.submission else authorization.decision_event_id
+                else projection.submission.event_id
+                if projection.submission
+                else authorization.decision_event_id
             ),
             payload={
                 "lifecycle_version": STEP3_LIFECYCLE_VERSION,
@@ -584,7 +582,11 @@ class ExecutionLifecycleService:
                 component=measurement.component,
                 value_ms=Milliseconds(value),
                 component_available_at=measurement.available_at,
-                recorded_at=now,
+                # A sample identity is derived from its immutable source event.
+                # Reconciliation runs repeatedly as later lifecycle events
+                # arrive, so using the current clock here would make an
+                # identical sample acquire different content on every replay.
+                recorded_at=measurement.source_event.recorded_at,
                 component_definition_version=self.config.component_definition_version,
                 estimator_schema_version=self.config.estimator_schema_version,
                 source_event_id=measurement.source_event.event_id,
@@ -676,7 +678,12 @@ class ExecutionLifecycleService:
             if projection.terminal_at is not None and projection.submitted_at > projection.terminal_at:
                 issues.append("submitted_at_after_terminal_at")
                 affected.update(
-                    {LatencyComponent.SUBMISSION, LatencyComponent.ACKNOWLEDGEMENT, LatencyComponent.FILL, LatencyComponent.FINAL_FILL}
+                    {
+                        LatencyComponent.SUBMISSION,
+                        LatencyComponent.ACKNOWLEDGEMENT,
+                        LatencyComponent.FILL,
+                        LatencyComponent.FINAL_FILL,
+                    }
                 )
         if projection.terminal is not None:
             terminal_executed = exact_decimal(
@@ -692,8 +699,7 @@ class ExecutionLifecycleService:
                 issues.append("terminal_executed_quantity_mismatch")
             state = projection.terminal_state
             if state is TerminalState.FULLY_FILLED and (
-                terminal_unfilled != 0
-                or (submitted is not None and terminal_executed != submitted)
+                terminal_unfilled != 0 or (submitted is not None and terminal_executed != submitted)
             ):
                 issues.append("fully_filled_state_quantity_mismatch")
             if state in {
@@ -701,13 +707,19 @@ class ExecutionLifecycleService:
                 TerminalState.PARTIALLY_FILLED_CANCELLED,
             } and (terminal_executed <= 0 or terminal_unfilled <= 0):
                 issues.append("partial_terminal_state_quantity_mismatch")
-            if state in {
-                TerminalState.EXPIRED_UNFILLED,
-                TerminalState.CANCELLED_UNFILLED,
-                TerminalState.REJECTED_UNFILLED,
-            } and terminal_executed != 0:
+            if (
+                state
+                in {
+                    TerminalState.EXPIRED_UNFILLED,
+                    TerminalState.CANCELLED_UNFILLED,
+                    TerminalState.REJECTED_UNFILLED,
+                }
+                and terminal_executed != 0
+            ):
                 issues.append("unfilled_terminal_state_has_execution")
-        if any(issue.startswith(("cumulative_fill_mismatch", "unfilled_quantity_mismatch", "overfill")) for issue in issues):
+        if any(
+            issue.startswith(("cumulative_fill_mismatch", "unfilled_quantity_mismatch", "overfill")) for issue in issues
+        ):
             affected.update({LatencyComponent.FILL, LatencyComponent.FINAL_FILL})
         return tuple(dict.fromkeys(issues)), tuple(sorted(affected, key=lambda component: component.value))
 
@@ -733,9 +745,7 @@ class ExecutionLifecycleService:
     ) -> AppendResult:
         canonical_issues = tuple(sorted(set(str(issue) for issue in invalid_sequences)))
         related_ids = tuple(sorted(set(event.event_id for event in related_events)))
-        signature = hashlib.sha256(
-            "\x1f".join((*canonical_issues, *related_ids, stage)).encode("utf-8")
-        ).hexdigest()
+        signature = hashlib.sha256("\x1f".join((*canonical_issues, *related_ids, stage)).encode("utf-8")).hexdigest()
         key = f"lifecycle_integrity_failure:{projection.root.decision_id}:{signature}"
         if existing := self._find_idempotency(projection, key):
             return AppendResult(existing, appended=False)
@@ -824,9 +834,7 @@ class ExecutionLifecycleService:
                 EventType.LIFECYCLE_INTEGRITY_FAILURE,
             }
         ]
-        signature = hashlib.sha256(
-            "\x1f".join(event.event_id for event in source_events).encode("utf-8")
-        ).hexdigest()
+        signature = hashlib.sha256("\x1f".join(event.event_id for event in source_events).encode("utf-8")).hexdigest()
         key = f"execution_evaluated:{projection.root.decision_id}:{signature}"
         if existing := self._find_idempotency(projection, key):
             return AppendResult(existing, appended=False)
@@ -858,7 +866,9 @@ class ExecutionLifecycleService:
         realised_cost = (
             fees + shortfall + cancellation_fee
             if fees is not None and shortfall is not None
-            else Decimal("0") if not projection.fills else None
+            else Decimal("0")
+            if not projection.fills
+            else None
         )
         supersedes = projection.latest_execution_evaluation
         occurred_at = normalize_timestamp(self.clock())

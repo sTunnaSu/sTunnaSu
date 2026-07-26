@@ -62,6 +62,7 @@ _ALPACA_SDK_LOCK = RLock()
 
 def _serialized_sdk_call(func):  # noqa: ANN001, ANN202
     """Serialize Alpaca SDK entry points to avoid concurrent lazy-import deadlocks."""
+
     @wraps(func)
     def wrapped(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
         with _ALPACA_SDK_LOCK:
@@ -156,7 +157,9 @@ class AlpacaConfig:
 _OVERRIDE_KEYS = ("api_key", "secret_key", "profile", "feed")
 
 
-def build_config(profile_config: Mapping[str, Any] | None = None, overrides: Mapping[str, Any] | None = None) -> "AlpacaConfig":
+def build_config(
+    profile_config: Mapping[str, Any] | None = None, overrides: Mapping[str, Any] | None = None
+) -> "AlpacaConfig":
     """Resolve config: saved file ← profile defaults ← CLI overrides."""
     base = asdict(load_config())
     for key, value in dict(profile_config or {}).items():
@@ -214,7 +217,8 @@ def _tap_cred_headers() -> dict[str, str]:
     backs both the order write and every read; the name is overridable via
     ``TAP_ALPACA_CREDENTIAL``.
     """
-    credential = os.environ.get(TAP_ALPACA_CREDENTIAL_ENV, DEFAULT_TAP_ALPACA_CREDENTIAL)  # noqa: env-gate — mirrors tap_forward.py, bootstrap-order independent
+    # This mirrors tap_forward.py and is bootstrap-order independent.
+    credential = os.environ.get(TAP_ALPACA_CREDENTIAL_ENV, DEFAULT_TAP_ALPACA_CREDENTIAL)
     return {
         "APCA-API-KEY-ID": f"<CREDENTIAL:{credential}.key_id>",
         "APCA-API-SECRET-KEY": f"<CREDENTIAL:{credential}.secret_key>",
@@ -259,8 +263,14 @@ def _rest_timeframe(period: str) -> str:
     """Canonical period token -> Alpaca REST timeframe string (mirrors
     :func:`_timeframe`). Case-sensitive: ``1m`` is one minute, ``1M`` one month."""
     return {
-        "1m": "1Min", "5m": "5Min", "15m": "15Min", "30m": "30Min",
-        "1h": "1Hour", "4h": "4Hour", "1w": "1Week", "1M": "1Month",
+        "1m": "1Min",
+        "5m": "5Min",
+        "15m": "15Min",
+        "30m": "30Min",
+        "1h": "1Hour",
+        "4h": "4Hour",
+        "1w": "1Week",
+        "1M": "1Month",
     }.get(period.strip(), "1Day")
 
 
@@ -287,7 +297,7 @@ def normalize_symbol(symbol: str) -> str:
         return clean
     for quote in _CRYPTO_QUOTE_CURRENCIES:
         if clean.endswith(quote) and len(clean) > len(quote) + 1:
-            return f"{clean[:-len(quote)]}/{quote}"
+            return f"{clean[: -len(quote)]}/{quote}"
     return clean
 
 
@@ -375,9 +385,7 @@ def get_assets(
         from alpaca.trading.requests import GetAssetsRequest  # type: ignore
 
         sdk_class = AssetClass.CRYPTO if class_token == "crypto" else AssetClass.US_EQUITY
-        raw_assets = client.get_all_assets(
-            GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=sdk_class)
-        )
+        raw_assets = client.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=sdk_class))
 
     rows = [_asset_to_dict(item, is_paper=cfg.is_paper) for item in _as_iter(raw_assets)]
     if tradable_only:
@@ -430,6 +438,25 @@ def get_account_snapshot(config: AlpacaConfig | None = None) -> dict[str, Any]:
 
 
 @_serialized_sdk_call
+def get_clock_snapshot(config: AlpacaConfig | None = None) -> dict[str, Any]:
+    """Fetch Alpaca's authenticated server clock for UTC-offset calibration."""
+    cfg = config or load_config()
+    if tap_forward.tap_enabled():
+        clock = _read_via_tap(f"{cfg.host}/v2/clock")
+    else:
+        clock = _trading_client(cfg).get_clock()
+    return {
+        "status": "ok",
+        "profile": cfg.profile,
+        "is_paper": cfg.is_paper,
+        "timestamp": str(_obj_get(clock, "timestamp", "")),
+        "is_open": bool(_obj_get(clock, "is_open", False)),
+        "next_open": str(_obj_get(clock, "next_open", "")),
+        "next_close": str(_obj_get(clock, "next_close", "")),
+    }
+
+
+@_serialized_sdk_call
 def get_positions(config: AlpacaConfig | None = None) -> dict[str, Any]:
     """Fetch current positions for the configured account."""
     cfg = config or load_config()
@@ -456,9 +483,7 @@ def get_open_orders(config: AlpacaConfig | None = None, *, include_executions: b
 
         open_orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
         closed = (
-            client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED))
-            if include_executions
-            else []
+            client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED)) if include_executions else []
         )
     result: dict[str, Any] = {
         "status": "ok",
@@ -467,9 +492,7 @@ def get_open_orders(config: AlpacaConfig | None = None, *, include_executions: b
         "open_orders": [_order_to_dict(item) for item in _as_iter(open_orders)],
     }
     if include_executions:
-        result["executions"] = [
-            _order_to_dict(item) for item in _as_iter(closed) if _obj_get(item, "filled_qty")
-        ]
+        result["executions"] = [_order_to_dict(item) for item in _as_iter(closed) if _obj_get(item, "filled_qty")]
     return result
 
 
@@ -530,17 +553,14 @@ def get_historical_bars(
     clean = normalize_symbol(symbol)
     crypto = is_crypto_symbol(clean)
     if tap_forward.tap_enabled() and crypto:
-        query = urlencode(
-            {"symbols": clean, "timeframe": _rest_timeframe(period), "limit": int(limit)}
-        )
+        query = urlencode({"symbols": clean, "timeframe": _rest_timeframe(period), "limit": int(limit)})
         payload = _read_via_tap(f"{DATA_HOST}/v1beta3/crypto/us/bars?{query}")
         bars_by_symbol = _obj_get(payload, "bars") or {}
         raw_rows = bars_by_symbol.get(clean, []) if isinstance(bars_by_symbol, Mapping) else []
         rows: Any = [_rename_keys(item, _BAR_KEY_ALIASES) for item in _as_iter(raw_rows)]
     elif tap_forward.tap_enabled():
         url = (
-            f"{DATA_HOST}/v2/stocks/{clean}/bars"
-            f"?timeframe={_rest_timeframe(period)}&limit={int(limit)}&feed={cfg.feed}"
+            f"{DATA_HOST}/v2/stocks/{clean}/bars?timeframe={_rest_timeframe(period)}&limit={int(limit)}&feed={cfg.feed}"
         )
         payload = _read_via_tap(url)
         rows = [_rename_keys(item, _BAR_KEY_ALIASES) for item in _as_iter(_obj_get(payload, "bars") or [])]
@@ -582,6 +602,7 @@ def place_order(
     order_type: str = "market",
     limit_price: float | None = None,
     time_in_force: str = "day",
+    client_order_id: str | None = None,
 ) -> dict[str, Any]:
     """Submit an order to the configured Alpaca account.
 
@@ -602,6 +623,8 @@ def place_order(
         limit_price: Required when ``order_type`` is ``limit``.
         time_in_force: Equities accept ``day``/``gtc``; crypto accepts
             ``gtc``/``ioc``.
+        client_order_id: Optional broker idempotency key. Phase 8 supplies its
+            immutable decision id here so a retry cannot place a second order.
 
     Returns:
         On success ``{"status": "ok", "order_id", "symbol", "side", "profile",
@@ -636,6 +659,10 @@ def place_order(
                 else "equity time_in_force must be 'day' or 'gtc'"
             ),
         }
+
+    client_id = str(client_order_id or "").strip() or None
+    if client_id is not None and len(client_id) > 48:
+        return {"status": "error", "error": "client_order_id cannot exceed 48 characters"}
 
     has_qty = quantity is not None
     has_notional = notional is not None
@@ -681,6 +708,7 @@ def place_order(
             order_type=type_token,
             limit_price=limit_value,
             time_in_force=tif_token,
+            client_order_id=client_id,
         )
 
     try:
@@ -698,6 +726,7 @@ def place_order(
             "ioc": TimeInForce.IOC,
         }[tif_token]
         amount = {"qty": qty_value} if has_qty else {"notional": notional_value}
+        request_identity = {"client_order_id": client_id} if client_id is not None else {}
 
         if type_token == "limit":
             req = LimitOrderRequest(
@@ -706,6 +735,7 @@ def place_order(
                 time_in_force=tif,
                 limit_price=limit_value,
                 **amount,
+                **request_identity,
             )
         else:
             req = MarketOrderRequest(
@@ -713,6 +743,7 @@ def place_order(
                 side=order_side,
                 time_in_force=tif,
                 **amount,
+                **request_identity,
             )
 
         order = client.submit_order(order_data=req)
@@ -736,6 +767,11 @@ def place_order(
         "limit_price": limit_value,
         "order_status": str(_obj_get(order, "status", "")),
         "filled_qty": _obj_get(order, "filled_qty"),
+        "filled_avg_price": _obj_get(order, "filled_avg_price"),
+        "client_order_id": str(_obj_get(order, "client_order_id", "") or client_id or ""),
+        "submitted_at": str(_obj_get(order, "submitted_at", "")),
+        "filled_at": str(_obj_get(order, "filled_at", "")),
+        "updated_at": str(_obj_get(order, "updated_at", "")),
     }
 
 
@@ -749,6 +785,7 @@ def _submit_via_tap(
     order_type: str,
     limit_price: float | None,
     time_in_force: str,
+    client_order_id: str | None,
 ) -> dict[str, Any]:
     """Place the order through the TAP proxy instead of the Alpaca SDK.
 
@@ -779,12 +816,14 @@ def _submit_via_tap(
     # forwarded the order but the agent saw a timeout) is deduplicated by Alpaca
     # — a duplicate id is rejected, never double-placed. Trade-off: two
     # intentionally-identical orders collide; vary any field for a real duplicate.
-    order["client_order_id"] = "tap-" + hashlib.sha256(
-        "|".join(
-            str(x)
-            for x in (cfg.profile, symbol, side, quantity, notional, order_type, limit_price, time_in_force)
-        ).encode()
-    ).hexdigest()[:24]
+    order["client_order_id"] = client_order_id or (
+        "tap-"
+        + hashlib.sha256(
+            "|".join(
+                str(x) for x in (cfg.profile, symbol, side, quantity, notional, order_type, limit_price, time_in_force)
+            ).encode()
+        ).hexdigest()[:24]
+    )
 
     cred_headers = _tap_cred_headers()
     target = f"{cfg.host}/v2/orders"
@@ -824,6 +863,11 @@ def _submit_via_tap(
         "limit_price": limit_price,
         "order_status": str(payload.get("status", "")),
         "filled_qty": payload.get("filled_qty"),
+        "filled_avg_price": payload.get("filled_avg_price"),
+        "client_order_id": str(payload.get("client_order_id") or order["client_order_id"]),
+        "submitted_at": str(payload.get("submitted_at") or ""),
+        "filled_at": str(payload.get("filled_at") or ""),
+        "updated_at": str(payload.get("updated_at") or ""),
         "via": "tap",
     }
 
@@ -1062,6 +1106,7 @@ def _asset_to_dict(item: Any, *, is_paper: bool) -> dict[str, Any]:
 def _order_to_dict(item: Any) -> dict[str, Any]:
     return {
         "order_id": str(_obj_get(item, "id", "")),
+        "client_order_id": str(_obj_get(item, "client_order_id", "")),
         "symbol": _obj_get(item, "symbol"),
         "side": str(_obj_get(item, "side", "")),
         "order_type": str(_obj_get(item, "order_type", "") or _obj_get(item, "type", "")),
@@ -1072,6 +1117,11 @@ def _order_to_dict(item: Any) -> dict[str, Any]:
         "limit_price": _obj_get(item, "limit_price"),
         "status": str(_obj_get(item, "status", "")),
         "submitted_at": str(_obj_get(item, "submitted_at", "")),
+        "filled_at": str(_obj_get(item, "filled_at", "")),
+        "updated_at": str(_obj_get(item, "updated_at", "")),
+        "canceled_at": str(_obj_get(item, "canceled_at", "")),
+        "expired_at": str(_obj_get(item, "expired_at", "")),
+        "failed_at": str(_obj_get(item, "failed_at", "")),
     }
 
 

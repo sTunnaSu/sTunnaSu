@@ -196,11 +196,7 @@ def terminal(
     cancellation_fee: str | None = None,
     acknowledgement: AcknowledgementAvailability = AcknowledgementAvailability.UNSUPPORTED,
 ) -> None:
-    reason = (
-        TerminalReason.FILLED
-        if state is TerminalState.FULLY_FILLED
-        else TerminalReason.EXPIRE_UNFILLED_REMAINDER
-    )
+    reason = TerminalReason.FILLED if state is TerminalState.FULLY_FILLED else TerminalReason.EXPIRE_UNFILLED_REMAINDER
     ctx.service.record_terminal(
         authorization,
         TerminalObservation(
@@ -296,6 +292,34 @@ def test_valid_acknowledgement_releases_real_component() -> None:
     assert len(history_window(ctx, LatencyComponent.ACKNOWLEDGEMENT).samples) == 1
 
 
+def test_later_callback_reconciliation_keeps_existing_sample_idempotent() -> None:
+    ctx = build_context()
+    authorization, _, _ = submission(ctx, quantity="1")
+    ctx.service.record_acknowledgement(
+        authorization,
+        AcknowledgementObservation(
+            order_id="order-1",
+            acknowledgement_id="ack-stable-history",
+            acknowledged_at=BASE + timedelta(milliseconds=250),
+        ),
+    )
+    ctx.clock.value += timedelta(seconds=1)
+
+    fill(
+        ctx,
+        authorization,
+        fill_id="fill-after-clock-advance",
+        fill_at=BASE + timedelta(milliseconds=300),
+        quantity="1",
+        cumulative="1",
+        unfilled="0",
+    )
+
+    assert len(history_window(ctx, LatencyComponent.SUBMISSION).samples) == 1
+    assert len(history_window(ctx, LatencyComponent.ACKNOWLEDGEMENT).samples) == 1
+    assert len(history_window(ctx, LatencyComponent.FILL).samples) == 1
+
+
 def test_acknowledgement_ingested_after_fill_uses_event_time_without_reordering_ledger() -> None:
     ctx = build_context()
     authorization, _, _ = submission(ctx, quantity="1")
@@ -322,9 +346,10 @@ def test_acknowledgement_ingested_after_fill_uses_event_time_without_reordering_
     fill_index = next(index for index, event in enumerate(stream) if event.event_type is EventType.FILL_RECEIVED)
     ack_index = next(index for index, event in enumerate(stream) if event.event_type is EventType.BROKER_ACKNOWLEDGED)
     assert fill_index < ack_index
-    assert ctx.service.projection(ctx.root.decision_id).latest_execution_evaluation.payload[
-        "lifecycle_audit"
-    ]["valid"] is True
+    assert (
+        ctx.service.projection(ctx.root.decision_id).latest_execution_evaluation.payload["lifecycle_audit"]["valid"]
+        is True
+    )
     assert len(history_window(ctx, LatencyComponent.ACKNOWLEDGEMENT).samples) == 1
 
 

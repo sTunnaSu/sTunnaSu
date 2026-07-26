@@ -1,0 +1,38 @@
+schema_version: 1
+runtime_name: agent-larry-phase8
+session_id: phase8-research-validation
+broker_profile_id: alpaca-paper-trade
+expected_paper_endpoint: https://paper-api.alpaca.markets
+
+# Keep the file non-mutating.  The CLI chooses the actual mode explicitly.
+mode: research_only
+paper_execution_authorized: false
+release_decision: GO_FOR_RESEARCH_ONLY
+release_limitations:
+  - No independently accepted paper strategy is bundled.
+  - AI, sentiment, and news adapters are explicitly unavailable unless configured.
+
+universe:
+  - BTC/USD
+accepted_strategies: []
+
+adaptive_research:
+  enabled: true
+  maximum_new_hypotheses_per_cycle: 2
+  shadow:
+    notional_usd: 50
+    taker_fee_bps: 25
+    slippage_bps_each_side: 5
+
+cycle_interval_seconds: 60
+maximum_cycles: 2
+pending_order_cancel_after_seconds: 30
+history_period: 1m
+history_limit: 120
+code_revision: replace-with-git-revision
+
+# Leave these blank to use ~/.vibe-trading/phase8/.
+database_path: ""
+phase8_ledger_path: ""
+report_directory: ""
+final_audit_path: agent/PHASE8_INDEPENDENT_AUDIT.md
